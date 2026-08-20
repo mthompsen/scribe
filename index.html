@@ -131,7 +131,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.4.1-fix";   // bump on every change so builds are identifiable
+const VERSION     = "1.5.0-worker";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -287,16 +287,28 @@ function skipID3(b){
  * Loaded lazily and ONLY when a large non-MP3 file needs converting, so the
  * ~32 MB download never happens for the common case.
  * ------------------------------------------------------------------ */
-const FFMPEG_JS   = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js";
-const FFMPEG_UTIL = "https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js";
-const CORE_BASE   = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+const FFMPEG_VER  = "0.12.10";
+const UTIL_VER    = "0.12.1";
+const CORE_VER    = "0.12.6";
+const CDN         = "https://unpkg.com";
 
 let _ffmpeg = null;
+
+/** Fetch a remote asset and expose it as a same-origin blob: URL.
+ *  Browsers refuse to start a Worker from a cross-origin script, so every
+ *  piece ffmpeg loads at runtime must be rehosted this way. */
+async function toBlobURL(url, mime){
+  const res = await fetch(url);
+  if(!res.ok) throw new Error(`fetch ${res.status} for ${url}`);
+  const buf = await res.arrayBuffer();
+  return URL.createObjectURL(new Blob([buf], { type: mime }));
+}
 
 function loadScript(src){
   return new Promise((res, rej) => {
     const s = document.createElement("script");
-    s.src = src; s.onload = res; s.onerror = () => rej(new Error("Failed to load " + src));
+    s.src = src; s.onload = res;
+    s.onerror = () => rej(new Error("could not load " + src));
     document.head.appendChild(s);
   });
 }
@@ -305,61 +317,69 @@ async function getFFmpeg(log){
   if(_ffmpeg) return _ffmpeg;
 
   log("  loading converter (one-time ~32 MB download)…");
-  await loadScript(FFMPEG_JS);
-  await loadScript(FFMPEG_UTIL);
 
-  const { FFmpeg }    = window.FFmpegWASM;
-  const { toBlobURL } = window.FFmpegUtil;
+  // Load the ffmpeg wrapper itself from a blob URL, so that the Worker it
+  // spawns internally is same-origin and not blocked.
+  const wrapperURL = await toBlobURL(
+    `${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/ffmpeg.js`, "text/javascript");
+  await loadScript(wrapperURL);
+
+  if(!window.FFmpegWASM) throw new Error("ffmpeg wrapper did not initialise");
+  const { FFmpeg } = window.FFmpegWASM;
 
   const ff = new FFmpeg();
-  ff.on("log", ({ message }) => {
-    // surface only the progress-ish lines, not the full ffmpeg banner
-    if(/time=|size=/.test(message)) log("    " + message.trim());
-  });
+  ff.on("log", ({ message }) => { if(/time=|size=/.test(message)) log("    " + message.trim()); });
 
-  await ff.load({
-    coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
-    wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
-  });
+  const coreBase = `${CDN}/@ffmpeg/core@${CORE_VER}/dist/umd`;
+  log("  fetching core…");
+  const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
+    toBlobURL(`${coreBase}/ffmpeg-core.js`,   "text/javascript"),
+    toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
+    toBlobURL(`${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, "text/javascript"),
+  ]);
 
+  await ff.load({ coreURL, wasmURL, classWorkerURL });
   _ffmpeg = ff;
+  log("  converter ready", "ok");
   return ff;
+}
+
+/** Read a File/Blob into a Uint8Array (used to hand data to the wasm FS). */
+async function toU8(file){
+  return new Uint8Array(await file.arrayBuffer());
 }
 
 /**
  * Convert any browser-decodable audio to 32 kbps mono 16 kHz MP3.
- * Those settings are chosen because Whisper downsamples to 16 kHz mono anyway,
- * so the reduction costs no transcription accuracy while typically shrinking a
- * file by 5-10x - usually enough to land under the API limit and skip splitting.
+ * Whisper downsamples to 16 kHz mono internally, so this costs no accuracy
+ * while typically shrinking a file 6-10x, usually below the API limit.
  */
 async function convertToMp3(file, log, onProgress){
   const ff = await getFFmpeg(log);
-  const { fetchFile } = window.FFmpegUtil;
 
   ff.on("progress", ({ progress }) => {
     if(progress > 0 && progress <= 1) onProgress(progress);
   });
 
-  const inName  = "in_" + Date.now();
-  const outName = "out.mp3";
+  const inName = "in.dat", outName = "out.mp3";
 
   log("  decoding and re-encoding…");
-  await ff.writeFile(inName, await fetchFile(file));
+  await ff.writeFile(inName, await toU8(file));
   await ff.exec([
     "-i", inName,
-    "-vn",                     // drop any video/cover-art stream
+    "-vn",
     "-codec:a", "libmp3lame",
     "-b:a", "32k",
-    "-ac", "1",                // mono
-    "-ar", "16000",            // 16 kHz, Whisper's internal rate
+    "-ac", "1",
+    "-ar", "16000",
     outName,
   ]);
 
   const data = await ff.readFile(outName);
-  // free the wasm heap copies promptly
   try{ await ff.deleteFile(inName); await ff.deleteFile(outName); }catch(e){}
 
   const blob = new Blob([data.buffer], { type: "audio/mpeg" });
+  if(!blob.size) throw new Error("conversion produced an empty file");
   log(`  converted: ${(file.size/1024/1024).toFixed(1)} MB -> ${(blob.size/1024/1024).toFixed(1)} MB`, "ok");
   return blob;
 }
