@@ -119,8 +119,8 @@
 </div>
 
 <p class="foot">
-  Runs entirely in your browser. Long files are split locally on MP3 frame
-  boundaries and stitched back with correct timestamps.<br>
+  Runs entirely in your browser. Long MP3s are split locally on frame boundaries;
+  other formats are converted automatically when they exceed the size limit.<br>
   Add to Home Screen to use it like an app.
 </p>
 
@@ -130,7 +130,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.3.0-validate";   // bump on every change so builds are identifiable
+const VERSION     = "1.4.0-convert";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -277,6 +277,88 @@ function skipID3(b){
     return 10 + ((b[6]&0x7F)<<21 | (b[7]&0x7F)<<14 | (b[8]&0x7F)<<7 | (b[9]&0x7F));
   }
   return 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * Optional in-browser conversion via ffmpeg.wasm
+ * Loaded lazily and ONLY when a large non-MP3 file needs converting, so the
+ * ~32 MB download never happens for the common case.
+ * ------------------------------------------------------------------ */
+const FFMPEG_JS   = "https://unpkg.com/@ffmpeg/ffmpeg@0.12.10/dist/umd/ffmpeg.js";
+const FFMPEG_UTIL = "https://unpkg.com/@ffmpeg/util@0.12.1/dist/umd/index.js";
+const CORE_BASE   = "https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd";
+
+let _ffmpeg = null;
+
+function loadScript(src){
+  return new Promise((res, rej) => {
+    const s = document.createElement("script");
+    s.src = src; s.onload = res; s.onerror = () => rej(new Error("Failed to load " + src));
+    document.head.appendChild(s);
+  });
+}
+
+async function getFFmpeg(log){
+  if(_ffmpeg) return _ffmpeg;
+
+  log("  loading converter (one-time ~32 MB download)…");
+  await loadScript(FFMPEG_JS);
+  await loadScript(FFMPEG_UTIL);
+
+  const { FFmpeg }    = window.FFmpegWASM;
+  const { toBlobURL } = window.FFmpegUtil;
+
+  const ff = new FFmpeg();
+  ff.on("log", ({ message }) => {
+    // surface only the progress-ish lines, not the full ffmpeg banner
+    if(/time=|size=/.test(message)) log("    " + message.trim());
+  });
+
+  await ff.load({
+    coreURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.js`,   "text/javascript"),
+    wasmURL: await toBlobURL(`${CORE_BASE}/ffmpeg-core.wasm`, "application/wasm"),
+  });
+
+  _ffmpeg = ff;
+  return ff;
+}
+
+/**
+ * Convert any browser-decodable audio to 32 kbps mono 16 kHz MP3.
+ * Those settings are chosen because Whisper downsamples to 16 kHz mono anyway,
+ * so the reduction costs no transcription accuracy while typically shrinking a
+ * file by 5-10x - usually enough to land under the API limit and skip splitting.
+ */
+async function convertToMp3(file, log, onProgress){
+  const ff = await getFFmpeg(log);
+  const { fetchFile } = window.FFmpegUtil;
+
+  ff.on("progress", ({ progress }) => {
+    if(progress > 0 && progress <= 1) onProgress(progress);
+  });
+
+  const inName  = "in_" + Date.now();
+  const outName = "out.mp3";
+
+  log("  decoding and re-encoding…");
+  await ff.writeFile(inName, await fetchFile(file));
+  await ff.exec([
+    "-i", inName,
+    "-vn",                     // drop any video/cover-art stream
+    "-codec:a", "libmp3lame",
+    "-b:a", "32k",
+    "-ac", "1",                // mono
+    "-ar", "16000",            // 16 kHz, Whisper's internal rate
+    outName,
+  ]);
+
+  const data = await ff.readFile(outName);
+  // free the wasm heap copies promptly
+  try{ await ff.deleteFile(inName); await ff.deleteFile(outName); }catch(e){}
+
+  const blob = new Blob([data.buffer], { type: "audio/mpeg" });
+  log(`  converted: ${(file.size/1024/1024).toFixed(1)} MB -> ${(blob.size/1024/1024).toFixed(1)} MB`, "ok");
+  return blob;
 }
 
 /**
@@ -447,10 +529,29 @@ go.onclick = async ()=>{
       log("Under the size limit — sending as one request.");
       parts = [{ blob: chosen, dur: 0 }];
     } else if(!info.splittable){
-      throw new Error(
-        `This file is ${mb.toFixed(1)} MB and is ${info.fmt.toUpperCase()}, not MP3. ` +
-        `Only MP3 can be split in the browser (other formats need decoding). ` +
-        `Convert it to MP3 first, or use a clip under 18 MB.`);
+      // Large and not MP3: convert. At 32 kbps mono this usually lands under the
+      // limit outright, so conversion replaces splitting rather than preceding it.
+      log(`${info.fmt.toUpperCase()} over the size limit — converting to MP3 first.`, "warn");
+      let converted;
+      try{
+        converted = await convertToMp3(chosen, log, p => setProgress(0.05 + 0.35 * p));
+      }catch(e){
+        throw new Error(
+          `This file is ${info.fmt.toUpperCase()}, not MP3, and automatic conversion failed ` +
+          `(${e.message}). Convert it manually with:\n\n` +
+          `  ffmpeg -i "${chosen.name}" -codec:a libmp3lame -b:a 32k -ac 1 out.mp3\n\n` +
+          `then upload out.mp3.`);
+      }
+
+      if(converted.size <= CHUNK_BYTES){
+        log("  now under the size limit — sending as one request.", "ok");
+        parts = [{ blob: converted, dur: 0 }];
+      } else {
+        log("  still over the limit — splitting the converted MP3…");
+        const plan = await planChunks(converted, CHUNK_BYTES, p => setProgress(0.40 + 0.06 * p));
+        log(`  ${plan.length} chunks`, "ok");
+        parts = plan.map(p => ({ blob: converted.slice(p.start, p.end, "audio/mpeg"), dur: p.dur }));
+      }
     } else {
       log("Scanning for frame boundaries (streaming, low memory)…");
       let plan;
