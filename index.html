@@ -71,6 +71,11 @@
   .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
   .actions button{flex:1;min-width:120px}
   .foot{color:var(--muted);font-size:12px;text-align:center;margin-top:20px;line-height:1.6}
+  #ver{font-family:var(--mono);font-size:11px;color:var(--muted);border:1px solid var(--border);
+       border-radius:5px;padding:1px 6px;margin-left:6px;white-space:nowrap}
+  #diag{font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--muted)}
+  #diag b{color:var(--text);font-weight:600}
+  #diag .bad{color:var(--err)} #diag .warn{color:var(--warn)} #diag .good{color:var(--ok)}
 </style>
 </head>
 <body>
@@ -125,6 +130,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
+const VERSION     = "1.3.0-validate";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -139,6 +145,55 @@ const keyEl=$("key"), toggleKey=$("toggleKey"), drop=$("drop"), fileEl=$("file")
       dlDoc=$("dlDoc");
 
 let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
+
+/* ------------------------------------------------------------------ *
+ * Version stamp + environment diagnostics
+ * ------------------------------------------------------------------ */
+(function(){
+  document.getElementById("ver").textContent = "v" + VERSION;
+
+  const d   = document.getElementById("diag");
+  const out = [];
+  let problem = false;
+
+  // Restricted context? content:// and file:// are opaque origins in Chrome.
+  const proto = location.protocol;
+  if(proto === "content:" || proto === "file:"){
+    problem = true;
+    out.push(`<span class="bad">&#9888; Opened via <b>${proto}</b></span> &mdash; this is a restricted
+      context. Storage and file handling are unreliable here. Host the file over http(s)
+      instead (see below).`);
+  } else {
+    out.push(`<span class="good">&check;</span> origin: <b>${proto}//${location.host||"local"}</b>`);
+  }
+
+  // localStorage actually usable?
+  let ls = "unavailable";
+  try{ localStorage.setItem("__t","1"); localStorage.removeItem("__t"); ls = "working"; }
+  catch(e){ problem = true; ls = "blocked (" + e.name + ")"; }
+  out.push(`${ls==="working" ? '<span class="good">&check;</span>' : '<span class="bad">&#10007;</span>'} localStorage: <b>${ls}</b> &mdash; your key ${ls==="working"?"will persist":"will NOT persist"}`);
+
+  // Device memory hint (Chrome only)
+  if(navigator.deviceMemory){
+    const dm = navigator.deviceMemory;
+    const cls = dm <= 2 ? "warn" : "good";
+    out.push(`<span class="${cls}">&#8226;</span> device memory: <b>~${dm} GB</b>`);
+  }
+  if(navigator.hardwareConcurrency)
+    out.push(`<span class="good">&#8226;</span> cores: <b>${navigator.hardwareConcurrency}</b>`);
+
+  out.push(`<span class="good">&#8226;</span> streaming split: <b>enabled</b> (peak memory ~1 MB)`);
+
+  d.innerHTML = out.join("<br>");
+  if(problem) d.style.display = "block";
+
+  // Always let the user open it manually
+  document.getElementById("ver").style.cursor = "pointer";
+  document.getElementById("ver").title = "Show diagnostics";
+  document.getElementById("ver").onclick = ()=>{
+    d.style.display = d.style.display === "none" ? "block" : "none";
+  };
+})();
 
 /* ------------------------------------------------------------------ *
  * Key persistence
@@ -224,31 +279,104 @@ function skipID3(b){
   return 0;
 }
 
-/** Split into [{blob, dur}] each <= target bytes, on frame boundaries. */
-function splitMP3(bytes, target){
-  let i = skipID3(bytes), n = bytes.length;
-  const chunks = [];
-  let start = i, acc = 0, frames = 0;
+/**
+ * Identify the real container from magic bytes. Extensions lie, especially on
+ * recorder apps that write AAC or MP4 into a file named .mp3.
+ */
+async function sniffFormat(file){
+  const head = new Uint8Array(await file.slice(0, 16).arrayBuffer());
+  const ascii = (a,b) => String.fromCharCode(...head.slice(a,b));
 
-  while(i < n-4){
-    const f = parseHeader(bytes, i);
-    if(!f){                              // resync
-      let j = -1;
-      for(let k=i+1;k<n;k++){ if(bytes[k]===0xFF){ j=k; break; } }
-      if(j<0) break;
-      i = j; continue;
+  if(ascii(0,3) === "ID3")                       return { fmt:"mp3",  splittable:true  };
+  if(head[0] === 0xFF && (head[1] & 0xE0) === 0xE0) return { fmt:"mp3", splittable:true };
+  if(ascii(0,4) === "RIFF" && ascii(8,12) === "WAVE") return { fmt:"wav",  splittable:false };
+  if(ascii(4,8) === "ftyp"){
+    const brand = ascii(8,12);
+    return { fmt: (brand.startsWith("M4A") ? "m4a" : "mp4/aac"), splittable:false };
+  }
+  if(ascii(0,4) === "OggS")                      return { fmt:"ogg",  splittable:false };
+  if(ascii(0,4) === "fLaC")                      return { fmt:"flac", splittable:false };
+  if(ascii(0,4) === "\x1aE\xdf\xa3")              return { fmt:"webm", splittable:false };
+  return { fmt:"unknown", splittable:false };
+}
+
+/**
+ * Stream-plan chunk boundaries WITHOUT loading the file into memory.
+ * Scans through a small sliding window and records only byte offsets, so peak
+ * memory is one window (1 MB) regardless of file size. Returns
+ * [{start, end, dur}] with every boundary on an MP3 frame edge.
+ */
+const WINDOW = 1 << 20;   // 1 MB scan window
+
+async function planChunks(file, target, onProgress){
+  const size = file.size;
+
+  // ID3v2 header, if present, lives in the first 10 bytes
+  let pos = 0;
+  {
+    const head = new Uint8Array(await file.slice(0, 10).arrayBuffer());
+    pos = skipID3(head);
+  }
+
+  let winStart = -1, win = null;
+  async function ensure(at){
+    // (re)load the window so that [at, at+4) is covered
+    if(winStart < 0 || at < winStart || at + 4 > winStart + win.length){
+      winStart = at;
+      const end = Math.min(at + WINDOW, size);
+      win = new Uint8Array(await file.slice(at, end).arrayBuffer());
+      if(win.length < 4) return false;
     }
+    return true;
+  }
+
+  const plan = [];
+  let chunkStart = pos, acc = 0, frames = 0, lastPct = 0, frameBytes = 0;
+
+  while(pos < size - 4){
+    if(!(await ensure(pos))) break;
+    const rel = pos - winStart;
+    const f = parseHeader(win, rel);
+
+    if(!f){
+      // resync: next 0xFF within the window, else slide the window forward
+      let j = -1;
+      for(let k = rel + 1; k < win.length; k++){ if(win[k] === 0xFF){ j = k; break; } }
+      if(j < 0){
+        if(winStart + win.length >= size) break;
+        pos = winStart + win.length - 3;
+        continue;
+      }
+      pos = winStart + j;
+      continue;
+    }
+
     frames++;
-    if((i + f.len) - start > target && i > start){
-      chunks.push({ bytes: bytes.subarray(start, i), dur: acc });
-      start = i; acc = 0;
+    frameBytes += f.len;
+    if((pos + f.len) - chunkStart > target && pos > chunkStart){
+      plan.push({ start: chunkStart, end: pos, dur: acc });
+      chunkStart = pos; acc = 0;
     }
     acc += f.dur;
-    i += f.len;
+    pos += f.len;
+
+    const pct = Math.floor(pos / size * 100);
+    if(onProgress && pct >= lastPct + 5){ lastPct = pct; onProgress(pos / size); await Promise.resolve(); }
   }
-  if(start < n) chunks.push({ bytes: bytes.subarray(start, n), dur: acc });
+
+  if(chunkStart < size) plan.push({ start: chunkStart, end: size, dur: acc });
   if(frames === 0) throw new Error("NOT_MP3");
-  return chunks;
+
+  // Sanity: in a real MP3 the frames are contiguous and account for essentially
+  // the whole file. Scanning non-MP3 data finds sparse false-positive sync words,
+  // which would otherwise produce chunks of garbage that the API rejects.
+  // Density = bytes consumed by VALID frames, not distance travelled by the
+  // scanner. Random data yields sparse false-positive sync words, so the frame
+  // bytes account for only a small fraction of the file.
+  const ratio = frameBytes / (size - plan[0].start);
+  if(ratio < 0.90) throw new Error("SPARSE_FRAMES:" + Math.round(ratio*100));
+
+  return plan;
 }
 
 /* ------------------------------------------------------------------ *
@@ -302,45 +430,65 @@ go.onclick = async ()=>{
   setProgress(0.02);
 
   try{
-    log(`Reading ${chosen.name} …`);
-    const buf   = await chosen.arrayBuffer();
-    const bytes = new Uint8Array(buf);
-    const mb    = bytes.length/1024/1024;
-    setProgress(0.08);
+    const mb = chosen.size / 1024 / 1024;
+    log(`${chosen.name} — ${mb.toFixed(1)} MB`);
+    setProgress(0.04);
+
+    // Build a list of Blob slices. Blobs are backed by the file on disk, so
+    // nothing large is ever held in memory.
+    // Identify the real container before doing anything with it
+    const info = await sniffFormat(chosen);
+    log(`  detected container: ${info.fmt}` +
+        (info.fmt === "mp3" ? "" : `  (extension says ${chosen.name.split(".").pop()})`),
+        info.fmt === "unknown" ? "warn" : null);
 
     let parts;
-    if(bytes.length <= CHUNK_BYTES){
-      log(`${mb.toFixed(1)} MB — sending as one request.`);
-      parts = [{ bytes, dur: 0 }];
+    if(chosen.size <= CHUNK_BYTES){
+      log("Under the size limit — sending as one request.");
+      parts = [{ blob: chosen, dur: 0 }];
+    } else if(!info.splittable){
+      throw new Error(
+        `This file is ${mb.toFixed(1)} MB and is ${info.fmt.toUpperCase()}, not MP3. ` +
+        `Only MP3 can be split in the browser (other formats need decoding). ` +
+        `Convert it to MP3 first, or use a clip under 18 MB.`);
     } else {
-      log(`${mb.toFixed(1)} MB — splitting locally…`);
+      log("Scanning for frame boundaries (streaming, low memory)…");
+      let plan;
       try{
-        parts = splitMP3(bytes, CHUNK_BYTES);
-        log(`  split into ${parts.length} chunks`, "ok");
+        plan = await planChunks(chosen, CHUNK_BYTES, p => setProgress(0.04 + 0.10 * p));
       }catch(e){
+        if(String(e.message).startsWith("SPARSE_FRAMES:")){
+          const pct = e.message.split(":")[1];
+          throw new Error(
+            `This file starts with an MP3 header but only ${pct}% of it parses as MP3 frames, ` +
+            `so it is probably mislabelled or corrupt. Splitting it would send invalid audio. ` +
+            `Try converting it to MP3, or use a clip under 18 MB.`);
+        }
         throw new Error(
-          "This file is over 18 MB and isn't a parseable MP3, so it can't be split in the browser. " +
-          "Convert it to MP3 first, or use a shorter clip.");
+          "This file is over 18 MB and isn't a parseable MP3, so it can't be split " +
+          "in the browser. Convert it to MP3 first, or use a shorter clip.");
       }
+      log(`  ${plan.length} chunks`, "ok");
+      parts = plan.map(p => ({ blob: chosen.slice(p.start, p.end, "audio/mpeg"), dur: p.dur }));
     }
 
     const segs = [];
     let offset = 0;
-    for(let i=0;i<parts.length;i++){
+    for(let i = 0; i < parts.length; i++){
       log(`Transcribing part ${i+1}/${parts.length} …`);
-      const blob = new Blob([parts[i].bytes], { type:"audio/mpeg" });
-      const json = await callGroq(blob, `part_${i}.mp3`, apiKey);
+      const json = await callGroq(parts[i].blob, `part_${i}.mp3`, apiKey);
 
       if(Array.isArray(json.segments) && json.segments.length){
         for(const s of json.segments){
-          const txt = (s.text||"").trim();
-          if(txt) segs.push({ t:(s.start||0)+offset, txt });
+          const txt = (s.text || "").trim();
+          if(txt) segs.push({ t: (s.start || 0) + offset, txt });
         }
       } else if(json.text){
         segs.push({ t: offset, txt: json.text.trim() });
       }
       offset += parts[i].dur;
-      setProgress(0.08 + 0.88 * (i+1)/parts.length);
+      parts[i].blob = null;               // release the slice reference promptly
+      setProgress(0.14 + 0.82 * (i+1) / parts.length);
     }
 
     if(!segs.length) throw new Error("No speech was detected in this file.");
