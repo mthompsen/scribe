@@ -76,6 +76,14 @@
   #diag{font-family:var(--mono);font-size:12px;line-height:1.7;color:var(--muted)}
   #diag b{color:var(--text);font-weight:600}
   #diag .bad{color:var(--err)} #diag .warn{color:var(--warn)} #diag .good{color:var(--ok)}
+  .libGroup{font-size:13px;font-weight:700;margin:10px 0 4px;color:var(--accent);
+            text-transform:uppercase;letter-spacing:.05em}
+  .libItem{display:flex;gap:8px;align-items:center;padding:7px 10px;margin-bottom:4px;
+           background:#0d1117;border:1px solid var(--border);border-radius:8px;font-size:13.5px}
+  .libItem .name{flex:1;cursor:pointer;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .libItem .name:hover{color:var(--accent)}
+  .libItem .date{font-family:var(--mono);font-size:11.5px;color:var(--muted);flex:0 0 auto}
+  .libItem button{padding:5px 9px;font-size:12px;flex:0 0 auto}
 </style>
 </head>
 <body>
@@ -116,7 +124,16 @@
     <button id="copy">Copy</button>
     <button id="dl">Download .txt</button>
     <button id="dlDoc">Download .doc</button>
+    <button id="dlOrg">Save organized</button>
   </div>
+</div>
+
+<div id="library" class="panel" style="display:none">
+  <div class="row" style="justify-content:space-between;margin-bottom:8px">
+    <label style="margin:0">Transcript library</label>
+    <button class="small" id="zipAll" type="button">Export .zip</button>
+  </div>
+  <div id="libList"></div>
 </div>
 
 <p class="foot">
@@ -131,10 +148,12 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.7.0-direct";   // bump on every change so builds are identifiable
+const VERSION     = "1.9.0-library";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
+const CHAT_MODEL  = "llama-3.3-70b-versatile";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
+const CHAT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
 
 /* ------------------------------------------------------------------ *
  * Elements
@@ -143,7 +162,7 @@ const $ = id => document.getElementById(id);
 const keyEl=$("key"), toggleKey=$("toggleKey"), drop=$("drop"), fileEl=$("file"),
       fileInfo=$("fileInfo"), go=$("go"), bar=$("bar"), logEl=$("log"),
       results=$("results"), out=$("out"), copyBtn=$("copy"), dlBtn=$("dl"),
-      dlDoc=$("dlDoc");
+      dlDoc=$("dlDoc"), dlOrg=$("dlOrg");
 
 let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
 
@@ -285,27 +304,23 @@ function skipID3(b){
 /* ------------------------------------------------------------------ *
  * Optional in-browser conversion via ffmpeg.wasm
  * Loaded lazily and ONLY when a large non-MP3 file needs converting, so the
- * ~32 MB download never happens for the common case.
+ * ~31 MB fetch never happens for the common case.
+ *
+ * Everything is vendored under vendor/ and served same-origin:
+ *   vendor/ffmpeg.js        @ffmpeg/ffmpeg 0.12.10 UMD wrapper
+ *   vendor/814.ffmpeg.js    its worker chunk
+ *   vendor/ffmpeg-core.js   @ffmpeg/core 0.12.10 **ESM** build
+ *   vendor/ffmpeg-core.wasm
+ *
+ * The ESM core is load-bearing, not a preference: when classWorkerURL is
+ * set, the wrapper spawns the worker with {type:"module"}, and module
+ * workers cannot importScripts() at all. The worker's only remaining path
+ * is dynamic import(coreURL), which needs the core to have an ESM default
+ * export. The UMD core has none — that mismatch was the "failed to import
+ * ffmpeg-core.js" bug, identical for every hosting scheme.
  * ------------------------------------------------------------------ */
-const FFMPEG_VER  = "0.12.10";
-const UTIL_VER    = "0.12.1";
-const CORE_VER    = "0.12.10";   // must match FFMPEG_VER; skew causes silent init failure
-const CDN         = "https://unpkg.com";
-
 let _ffmpeg = null;
-
-/** Fetch a remote asset and expose it as a same-origin blob: URL.
- *  Browsers refuse to start a Worker from a cross-origin script, so every
- *  piece ffmpeg loads at runtime must be rehosted this way. */
-async function toBlobURL(url, mime){
-  let res;
-  try{ res = await fetch(url); }
-  catch(e){ throw new Error(`network error fetching ${url.split("/").pop()}: ${e.message}`); }
-  if(!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split("/").pop()}`);
-  const buf = await res.arrayBuffer();
-  if(!buf.byteLength) throw new Error(`empty response for ${url.split("/").pop()}`);
-  return URL.createObjectURL(new Blob([buf], { type: mime }));
-}
+let _convProgress = null;   // current conversion's progress callback
 
 function loadScript(src){
   return new Promise((res, rej) => {
@@ -319,63 +334,25 @@ function loadScript(src){
 async function getFFmpeg(log){
   if(_ffmpeg) return _ffmpeg;
 
-  log("  loading converter (one-time ~32 MB download)…");
-
-  // Load the ffmpeg wrapper itself from a blob URL, so that the Worker it
-  // spawns internally is same-origin and not blocked.
-  const wrapperURL = await toBlobURL(
-    `${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/ffmpeg.js`, "text/javascript");
-  await loadScript(wrapperURL);
-
+  log("  loading converter (one-time ~31 MB)…");
+  await loadScript("vendor/ffmpeg.js");
   if(!window.FFmpegWASM) throw new Error("ffmpeg wrapper did not initialise");
   const { FFmpeg } = window.FFmpegWASM;
 
   const ff = new FFmpeg();
   ff.on("log", ({ message }) => { if(/time=|size=/.test(message)) log("    " + message.trim()); });
+  ff.on("progress", ({ progress }) => {
+    if(_convProgress && progress > 0 && progress <= 1) _convProgress(progress);
+  });
 
-  const coreBase = `${CDN}/@ffmpeg/core@${CORE_VER}/dist/umd`;
-
-  // Only the worker script must be same-origin (browsers refuse cross-origin
-  // Workers). The core JS and wasm are fetched BY the worker, which is now
-  // same-origin, so they can point straight at the CDN. Handing the worker a
-  // blob: URL for the core breaks importScripts() and also breaks the core's
-  // relative lookup of its own .wasm file.
-  log("  fetching worker…");
-  const classWorkerURL = await toBlobURL(
-    `${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, "text/javascript");
-
-  log("  initialising ffmpeg core (downloads ~31 MB on first run)…");
-
-  const attempts = [
-    { name: "direct CDN",  coreURL: `${coreBase}/ffmpeg-core.js`,
-                           wasmURL: `${coreBase}/ffmpeg-core.wasm` },
-    { name: "jsdelivr",    coreURL: `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VER}/dist/umd/ffmpeg-core.js`,
-                           wasmURL: `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VER}/dist/umd/ffmpeg-core.wasm` },
-    { name: "blob-hosted", blob: true },
-  ];
-
-  let lastErr = null;
-  for(const a of attempts){
-    try{
-      let coreURL = a.coreURL, wasmURL = a.wasmURL;
-      if(a.blob){
-        coreURL = await toBlobURL(`${coreBase}/ffmpeg-core.js`,   "text/javascript");
-        wasmURL = await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm");
-      }
-      await ff.load({ coreURL, wasmURL, classWorkerURL });
-      log(`  core loaded (${a.name})`, "ok");
-      lastErr = null;
-      break;
-    }catch(e){
-      lastErr = e;
-      console.warn(`core load via ${a.name} failed:`, e);
-      log(`    ${a.name} failed, trying next…`, "warn");
-    }
-  }
-  if(lastErr){
-    const d = (lastErr && (lastErr.message || lastErr.name)) || JSON.stringify(lastErr) || "no detail";
-    throw new Error("all core load strategies failed. Last error: " + d);
-  }
+  // classWorkerURL must be absolute: the wrapper resolves relative values
+  // against its own build-time base, not this page.
+  const abs = p => new URL(p, location.href).href;
+  await ff.load({
+    classWorkerURL: abs("vendor/814.ffmpeg.js"),
+    coreURL:        abs("vendor/ffmpeg-core.js"),
+    wasmURL:        abs("vendor/ffmpeg-core.wasm"),
+  });
 
   _ffmpeg = ff;
   log("  converter ready", "ok");
@@ -394,17 +371,26 @@ async function toU8(file){
  */
 async function convertToMp3(file, log, onProgress){
   const ff = await getFFmpeg(log);
+  _convProgress = onProgress;
 
-  ff.on("progress", ({ progress }) => {
-    if(progress > 0 && progress <= 1) onProgress(progress);
-  });
-
-  const inName = "in.dat", outName = "out.mp3";
+  const outName = "out.mp3";
+  let inPath = "/work/in.dat", mounted = false;
 
   log("  decoding and re-encoding…");
-  await ff.writeFile(inName, await toU8(file));
+  // Mount the File via WORKERFS so ffmpeg reads it lazily from disk —
+  // no whole-file copy into memory. Fall back to a copy if mounting fails.
+  try{
+    await ff.createDir("/work");
+    await ff.mount("WORKERFS", { files: [new File([file], "in.dat")] }, "/work");
+    mounted = true;
+  }catch(e){
+    console.warn("WORKERFS mount failed, falling back to in-memory copy:", e);
+    inPath = "in.dat";
+    await ff.writeFile(inPath, await toU8(file));
+  }
+
   await ff.exec([
-    "-i", inName,
+    "-i", inPath,
     "-vn",
     "-codec:a", "libmp3lame",
     "-b:a", "32k",
@@ -414,7 +400,12 @@ async function convertToMp3(file, log, onProgress){
   ]);
 
   const data = await ff.readFile(outName);
-  try{ await ff.deleteFile(inName); await ff.deleteFile(outName); }catch(e){}
+  _convProgress = null;
+  try{
+    if(mounted){ await ff.unmount("/work"); await ff.deleteDir("/work"); }
+    else await ff.deleteFile(inPath);
+    await ff.deleteFile(outName);
+  }catch(e){}
 
   const blob = new Blob([data.buffer], { type: "audio/mpeg" });
   if(!blob.size) throw new Error("conversion produced an empty file");
@@ -750,6 +741,253 @@ dlDoc.onclick = ()=>{
     `<h1 style="color:#1F3864">${baseName} — transcript</h1>${body}</body></html>`;
   download(`${baseName}_${suffix}.doc`, html, "application/msword");
 };
+
+/* ------------------------------------------------------------------ *
+ * Organized save: analyze the transcript for subject area and date via
+ * Groq, pretty-print it as a standalone HTML page, and file it under a
+ * Transcriptions/<Subject>/ sub-directory (File System Access API where
+ * available, otherwise a labelled download).
+ * ------------------------------------------------------------------ */
+const sanitizeName = s => String(s||"").replace(/[\\/:*?"<>|]/g,"-").replace(/\s+/g," ").trim();
+const fmtDate = ms => {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
+};
+
+async function analyzeTranscript(apiKey){
+  const res = await fetch(CHAT_ENDPOINT, {
+    method: "POST",
+    headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+    body: JSON.stringify({
+      model: CHAT_MODEL,
+      temperature: 0,
+      response_format: { type: "json_object" },
+      messages: [
+        { role: "system", content:
+          'You label transcripts for filing. Reply with JSON only, in this shape: ' +
+          '{"subject": "...", "date": "YYYY-MM-DD" | null, "title": "..."}. ' +
+          '"subject" is a short academic subject-area label suitable as a folder name ' +
+          '(e.g. "Theology", "Philosophy", "History", "Biology", "Computer Science", ' +
+          '"Business", "Law", "Literature") — pick the best fit for the content. ' +
+          '"date" is the date the recording was made ONLY if the transcript states or ' +
+          'clearly implies it, else null. "title" is a concise descriptive title, ' +
+          'at most 8 words, no quotes.' },
+        { role: "user", content: (cleanText || tsText).slice(0, 6000) }
+      ]
+    })
+  });
+  if(!res.ok) throw new Error("analysis request failed (HTTP " + res.status + ")");
+  const j = await res.json();
+  return JSON.parse(j.choices[0].message.content);
+}
+
+function prettyHtml(subject, date, title, clean, ts){
+  const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+  const paras = clean.split("\n\n").map(p => `<p>${esc(p)}</p>`).join("\n");
+  const tsRows = ts.split("\n").map(l => {
+    const m = l.match(/^(\[[\d:]+\])\s+(.*)$/);
+    return m ? `<tr><td class="t">${esc(m[1])}</td><td>${esc(m[2])}</td></tr>` : "";
+  }).join("\n");
+  return `<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>${esc(title)}</title>
+<style>
+  body{font-family:Georgia,"Times New Roman",serif;max-width:46em;margin:0 auto;
+       padding:3em 1.5em;line-height:1.7;color:#1a1a1a;background:#fdfcf9}
+  header{border-bottom:2px solid #1a1a1a;margin-bottom:2em;padding-bottom:1em}
+  h1{font-size:1.7em;margin:0 0 .3em}
+  .meta{font-family:system-ui,sans-serif;font-size:.85em;color:#555;
+        text-transform:uppercase;letter-spacing:.06em}
+  p{margin:0 0 1.1em;text-align:justify}
+  details{margin-top:2.5em;font-family:system-ui,sans-serif;font-size:.9em}
+  summary{cursor:pointer;font-weight:600;margin-bottom:.8em}
+  table{border-collapse:collapse;width:100%}
+  td{vertical-align:top;padding:.25em .6em .25em 0}
+  td.t{font-family:ui-monospace,monospace;white-space:nowrap;color:#777}
+  @media print{details{display:none}}
+</style></head><body>
+<header>
+  <h1>${esc(title)}</h1>
+  <div class="meta">${esc(subject)} &middot; ${esc(date)}</div>
+</header>
+${paras}
+<details><summary>Timestamped transcript</summary><table>${tsRows}</table></details>
+</body></html>`;
+}
+
+dlOrg.onclick = async ()=>{
+  if(!cleanText && !tsText){ alert("Transcribe something first."); return; }
+  dlOrg.disabled = true; dlOrg.textContent = "Analyzing…";
+  try{
+    let meta = { subject: "Uncategorized", date: null, title: baseName };
+    try{
+      const a = await analyzeTranscript(keyEl.value.trim());
+      if(a && typeof a === "object") meta = Object.assign(meta, a);
+    }catch(e){ console.warn("transcript analysis failed, using fallbacks:", e); }
+
+    const subject = sanitizeName(meta.subject) || "Uncategorized";
+    const date    = /^\d{4}-\d{2}-\d{2}$/.test(meta.date||"") ? meta.date
+                    : fmtDate(chosen ? chosen.lastModified : Date.now());
+    const title   = sanitizeName(meta.title) || baseName;
+
+    await dbPut({
+      subject, date, title,
+      clean: cleanText, ts: tsText,
+      html: prettyHtml(subject, date, title, cleanText, tsText),
+      source: chosen ? chosen.name : "", createdAt: Date.now(),
+    });
+    await renderLibrary();
+    dlOrg.textContent = "Saved to library";
+  }catch(e){
+    alert("Organized save failed: " + e.message);
+    dlOrg.textContent = "Save organized";
+  }finally{
+    setTimeout(()=>{ dlOrg.textContent = "Save organized"; dlOrg.disabled = false; }, 1500);
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ * Transcript library: archived in IndexedDB, displayed grouped by
+ * subject, each entry viewable, downloadable, and deletable, with a
+ * one-click export of the whole archive as Transcriptions/<Subject>/…
+ * inside a .zip (built in vanilla JS — STORE method, no dependencies).
+ * ------------------------------------------------------------------ */
+const libPanel = $("library"), libList = $("libList"), zipAll = $("zipAll");
+
+function dbOpen(){
+  return new Promise((res, rej)=>{
+    const r = indexedDB.open("scribe", 1);
+    r.onupgradeneeded = ()=> r.result.createObjectStore("transcripts", { keyPath:"id", autoIncrement:true });
+    r.onsuccess = ()=> res(r.result);
+    r.onerror   = ()=> rej(r.error);
+  });
+}
+async function dbPut(rec){
+  const db = await dbOpen();
+  return new Promise((res, rej)=>{
+    const t = db.transaction("transcripts","readwrite").objectStore("transcripts").put(rec);
+    t.onsuccess = ()=> res(t.result); t.onerror = ()=> rej(t.error);
+  });
+}
+async function dbAll(){
+  const db = await dbOpen();
+  return new Promise((res, rej)=>{
+    const t = db.transaction("transcripts").objectStore("transcripts").getAll();
+    t.onsuccess = ()=> res(t.result || []); t.onerror = ()=> rej(t.error);
+  });
+}
+async function dbDel(id){
+  const db = await dbOpen();
+  return new Promise((res, rej)=>{
+    const t = db.transaction("transcripts","readwrite").objectStore("transcripts").delete(id);
+    t.onsuccess = ()=> res(); t.onerror = ()=> rej(t.error);
+  });
+}
+
+async function renderLibrary(){
+  let recs = [];
+  try{ recs = await dbAll(); }catch(e){ console.warn("library unavailable:", e); return; }
+  libPanel.style.display = recs.length ? "block" : "none";
+  libList.innerHTML = "";
+  const bySubject = new Map();
+  for(const r of recs){
+    if(!bySubject.has(r.subject)) bySubject.set(r.subject, []);
+    bySubject.get(r.subject).push(r);
+  }
+  for(const subject of [...bySubject.keys()].sort()){
+    const g = document.createElement("div");
+    g.className = "libGroup"; g.textContent = subject;
+    libList.appendChild(g);
+    const items = bySubject.get(subject).sort((a,b)=> (b.date||"").localeCompare(a.date||""));
+    for(const r of items){
+      const row = document.createElement("div");
+      row.className = "libItem";
+      const name = document.createElement("span");
+      name.className = "name"; name.textContent = r.title; name.title = "View";
+      name.onclick = ()=>{
+        cleanText = r.clean; tsText = r.ts; baseName = r.title;
+        render(); results.classList.add("show");
+        results.scrollIntoView({ behavior:"smooth", block:"nearest" });
+      };
+      const date = document.createElement("span");
+      date.className = "date"; date.textContent = r.date;
+      const dlB = document.createElement("button");
+      dlB.textContent = "HTML";
+      dlB.onclick = ()=> download(`${r.date} — ${r.title}.html`, r.html, "text/html;charset=utf-8");
+      const delB = document.createElement("button");
+      delB.textContent = "✕"; delB.title = "Delete";
+      delB.onclick = async ()=>{ await dbDel(r.id); renderLibrary(); };
+      row.append(name, date, dlB, delB);
+      libList.appendChild(row);
+    }
+  }
+}
+renderLibrary();
+
+/* Minimal ZIP writer (STORE, UTF-8 names). */
+const CRC_TABLE = (()=>{
+  const t = new Uint32Array(256);
+  for(let n=0; n<256; n++){
+    let c = n;
+    for(let k=0; k<8; k++) c = (c & 1) ? 0xEDB88320 ^ (c >>> 1) : c >>> 1;
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(u8){
+  let c = 0xFFFFFFFF;
+  for(let i=0; i<u8.length; i++) c = CRC_TABLE[(c ^ u8[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function buildZip(entries){   // entries: [{path, data:Uint8Array}]
+  const enc = new TextEncoder();
+  const now = new Date();
+  const dosTime = (now.getHours()<<11) | (now.getMinutes()<<5) | (now.getSeconds()>>1);
+  const dosDate = ((now.getFullYear()-1980)<<9) | ((now.getMonth()+1)<<5) | now.getDate();
+  const chunks = [], central = [];
+  let offset = 0;
+  const u16 = v => [v & 255, (v>>>8) & 255];
+  const u32 = v => [v & 255, (v>>>8) & 255, (v>>>16) & 255, (v>>>24) & 255];
+  for(const e of entries){
+    const name = enc.encode(e.path), crc = crc32(e.data), n = e.data.length;
+    const common = [...u16(20), ...u16(0x0800), ...u16(0), ...u16(dosTime), ...u16(dosDate),
+                    ...u32(crc), ...u32(n), ...u32(n), ...u16(name.length), ...u16(0)];
+    chunks.push(new Uint8Array([...u32(0x04034b50), ...common]), name, e.data);
+    central.push({ common, name, offset });
+    offset += 30 + name.length + n;
+  }
+  let cdSize = 0;
+  for(const c of central){
+    const rec = new Uint8Array([...u32(0x02014b50), ...u16(20), ...c.common,
+                                ...u16(0), ...u16(0), ...u16(0), ...u32(0), ...u32(c.offset)]);
+    chunks.push(rec, c.name);
+    cdSize += rec.length + c.name.length;
+  }
+  chunks.push(new Uint8Array([...u32(0x06054b50), ...u16(0), ...u16(0),
+                              ...u16(central.length), ...u16(central.length),
+                              ...u32(cdSize), ...u32(offset), ...u16(0)]));
+  return new Blob(chunks, { type: "application/zip" });
+}
+
+zipAll.onclick = async ()=>{
+  const recs = await dbAll();
+  if(!recs.length) return;
+  const enc = new TextEncoder(), seen = new Set(), entries = [];
+  for(const r of recs){
+    let path = `Transcriptions/${r.subject}/${r.date} — ${r.title}.html`, i = 2;
+    while(seen.has(path)) path = `Transcriptions/${r.subject}/${r.date} — ${r.title} (${i++}).html`;
+    seen.add(path);
+    entries.push({ path, data: enc.encode(r.html) });
+  }
+  const blob = buildZip(entries);
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url; a.download = `Transcriptions ${fmtDate(Date.now())}.zip`;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=> URL.revokeObjectURL(url), 1000);
+};
+
 </script>
 </body>
 </html>
