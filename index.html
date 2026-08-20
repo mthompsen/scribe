@@ -81,7 +81,8 @@
 <body>
 
 <h1>Scribe</h1>
-<p class="sub">Free audio transcription — timestamped &amp; clean</p>
+<p class="sub">Free audio transcription — timestamped &amp; clean <span id="ver"></span></p>
+<div id="diag" class="panel" style="display:none"></div>
 
 <div class="panel">
   <label for="key">Groq API key</label>
@@ -130,7 +131,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.4.0-convert";   // bump on every change so builds are identifiable
+const VERSION     = "1.4.1-fix";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -149,10 +150,12 @@ let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
 /* ------------------------------------------------------------------ *
  * Version stamp + environment diagnostics
  * ------------------------------------------------------------------ */
-(function(){
-  document.getElementById("ver").textContent = "v" + VERSION;
+try{ (function(){
+  const verEl = document.getElementById("ver");
+  if(verEl) verEl.textContent = "v" + VERSION;
 
   const d   = document.getElementById("diag");
+  if(!d) return;
   const out = [];
   let problem = false;
 
@@ -188,12 +191,12 @@ let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
   if(problem) d.style.display = "block";
 
   // Always let the user open it manually
-  document.getElementById("ver").style.cursor = "pointer";
-  document.getElementById("ver").title = "Show diagnostics";
-  document.getElementById("ver").onclick = ()=>{
-    d.style.display = d.style.display === "none" ? "block" : "none";
-  };
-})();
+  if(verEl){
+    verEl.style.cursor = "pointer";
+    verEl.title = "Show diagnostics";
+    verEl.onclick = ()=>{ d.style.display = d.style.display === "none" ? "block" : "none"; };
+  }
+})(); }catch(err){ console.warn("diagnostics failed (non-fatal):", err); }
 
 /* ------------------------------------------------------------------ *
  * Key persistence
