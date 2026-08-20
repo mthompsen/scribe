@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0d1117">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<title>Scribe — transcribe audio</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --border:#21262d;
+    --text:#e6edf3; --muted:#8b949e;
+    --accent:#58a6ff; --ok:#3fb950; --warn:#d29922; --err:#f85149;
+    --mono:ui-monospace,"SF Mono",SFMono-Regular,Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;
+  }
+  *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{margin:0;padding:0;background:var(--bg);color:var(--text);font-family:var(--sans)}
+  body{padding:max(16px,env(safe-area-inset-top)) 16px max(24px,env(safe-area-inset-bottom));
+       max-width:720px;margin:0 auto;min-height:100vh}
+  h1{font-size:28px;margin:8px 0 2px;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:14px;margin:0 0 20px}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;
+         padding:14px;margin-bottom:12px}
+  label{display:block;font-size:13px;font-weight:600;margin-bottom:6px}
+  .hint{font-size:12px;color:var(--muted);margin-top:6px;line-height:1.45}
+  a{color:var(--accent)}
+  input[type=password],input[type=text]{
+    width:100%;background:#0d1117;border:1px solid var(--border);border-radius:8px;
+    color:var(--text);padding:12px;font-size:16px;font-family:var(--mono)}
+  input:focus{outline:none;border-color:var(--accent)}
+  .row{display:flex;gap:8px;align-items:center}
+  button{font-family:inherit;font-size:15px;font-weight:600;border-radius:8px;
+         border:1px solid var(--border);background:#21262d;color:var(--text);
+         padding:12px 14px;cursor:pointer;transition:.15s}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.45;cursor:not-allowed}
+  button.primary{background:var(--accent);color:#04121f;border-color:var(--accent);
+                 width:100%;padding:15px;font-size:16px;margin-bottom:12px}
+  button.small{padding:12px;flex:0 0 auto}
+  .drop{border:2px dashed var(--border);border-radius:12px;padding:26px 16px;text-align:center;
+        cursor:pointer;transition:.15s;background:var(--panel)}
+  .drop:hover,.drop.over{border-color:var(--accent);background:#1c2333}
+  .drop .big{font-size:15px;font-weight:600;margin-bottom:4px}
+  .drop .small{font-size:12.5px;color:var(--muted)}
+  .file{display:none;margin-top:10px;padding:10px 12px;background:#0d1117;
+        border:1px solid var(--border);border-radius:8px;font-family:var(--mono);font-size:13px}
+  .file.show{display:block}
+  progress{width:100%;height:8px;border:none;border-radius:4px;background:var(--border);
+           margin-bottom:12px;display:none}
+  progress.show{display:block}
+  progress::-webkit-progress-bar{background:var(--border);border-radius:4px}
+  progress::-webkit-progress-value{background:var(--accent);border-radius:4px}
+  progress::-moz-progress-bar{background:var(--accent);border-radius:4px}
+  #log{font-family:var(--mono);font-size:12.5px;line-height:1.6;color:var(--muted);
+       white-space:pre-wrap;word-break:break-word;max-height:230px;overflow-y:auto;
+       display:none}
+  #log.show{display:block}
+  .ok{color:var(--ok)} .warn{color:var(--warn)} .err{color:var(--err)} .hl{color:var(--text)}
+  #results{display:none}
+  #results.show{display:block}
+  .tabs{display:flex;gap:6px;margin-bottom:10px}
+  .tab{flex:1;padding:10px;text-align:center;font-size:14px;font-weight:600;
+       background:#21262d;border:1px solid var(--border);border-radius:8px;cursor:pointer}
+  .tab.active{background:var(--accent);color:#04121f;border-color:var(--accent)}
+  #out{background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:14px;
+       max-height:340px;overflow-y:auto;font-size:14.5px;line-height:1.65;white-space:pre-wrap;
+       word-break:break-word}
+  #out.ts{font-family:var(--mono);font-size:13px}
+  .actions{display:flex;gap:8px;margin-top:10px;flex-wrap:wrap}
+  .actions button{flex:1;min-width:120px}
+  .foot{color:var(--muted);font-size:12px;text-align:center;margin-top:20px;line-height:1.6}
+</style>
+</head>
+<body>
+
+<h1>Scribe</h1>
+<p class="sub">Free audio transcription — timestamped &amp; clean</p>
+
+<div class="panel">
+  <label for="key">Groq API key</label>
+  <div class="row">
+    <input id="key" type="password" placeholder="gsk_…" autocomplete="off" spellcheck="false">
+    <button class="small" id="toggleKey" type="button">Show</button>
+  </div>
+  <div class="hint">Stored only in this browser (localStorage), never sent anywhere except Groq.
+    Get one free at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>.</div>
+</div>
+
+<div class="drop" id="drop">
+  <div class="big">Tap to choose audio</div>
+  <div class="small">MP3, WAV, M4A, FLAC, OGG — or drag &amp; drop</div>
+  <input id="file" type="file" accept="audio/*,.mp3,.wav,.m4a,.mp4,.flac,.ogg,.webm" hidden>
+</div>
+<div class="file" id="fileInfo"></div>
+
+<div style="height:12px"></div>
+<button class="primary" id="go" disabled>Transcribe</button>
+<progress id="bar" max="100" value="0"></progress>
+<div id="log"></div>
+
+<div id="results">
+  <div class="tabs">
+    <div class="tab active" data-view="clean">Clean</div>
+    <div class="tab" data-view="ts">Timestamped</div>
+  </div>
+  <div id="out"></div>
+  <div class="actions">
+    <button id="copy">Copy</button>
+    <button id="dl">Download .txt</button>
+    <button id="dlDoc">Download .doc</button>
+  </div>
+</div>
+
+<p class="foot">
+  Runs entirely in your browser. Long files are split locally on MP3 frame
+  boundaries and stitched back with correct timestamps.<br>
+  Add to Home Screen to use it like an app.
+</p>
+
+<script>
+"use strict";
+
+/* ------------------------------------------------------------------ *
+ * Config
+ * ------------------------------------------------------------------ */
+const MODEL       = "whisper-large-v3";
+const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
+const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
+
+/* ------------------------------------------------------------------ *
+ * Elements
+ * ------------------------------------------------------------------ */
+const $ = id => document.getElementById(id);
+const keyEl=$("key"), toggleKey=$("toggleKey"), drop=$("drop"), fileEl=$("file"),
+      fileInfo=$("fileInfo"), go=$("go"), bar=$("bar"), logEl=$("log"),
+      results=$("results"), out=$("out"), copyBtn=$("copy"), dlBtn=$("dl"),
+      dlDoc=$("dlDoc");
+
+let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
+
+/* ------------------------------------------------------------------ *
+ * Key persistence
+ * ------------------------------------------------------------------ */
+try{ const k=localStorage.getItem("scribe_key"); if(k) keyEl.value=k; }catch(e){}
+keyEl.addEventListener("input", ()=>{ try{ localStorage.setItem("scribe_key", keyEl.value.trim()); }catch(e){} });
+toggleKey.onclick = ()=>{
+  const pw = keyEl.type==="password";
+  keyEl.type = pw ? "text" : "password";
+  toggleKey.textContent = pw ? "Hide" : "Show";
+};
+
+/* ------------------------------------------------------------------ *
+ * Logging / progress
+ * ------------------------------------------------------------------ */
+function log(msg, cls){
+  logEl.classList.add("show");
+  const span = cls ? `<span class="${cls}">${msg}</span>` : msg;
+  logEl.innerHTML += span + "\n";
+  logEl.scrollTop = logEl.scrollHeight;
+}
+function setProgress(p){ bar.classList.add("show"); bar.value = Math.round(p*100); }
+
+/* ------------------------------------------------------------------ *
+ * File selection
+ * ------------------------------------------------------------------ */
+drop.onclick = ()=> fileEl.click();
+["dragenter","dragover"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("over")}));
+["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over")}));
+drop.addEventListener("drop", ev=>{ if(ev.dataTransfer.files[0]) pick(ev.dataTransfer.files[0]); });
+fileEl.onchange = ()=>{ if(fileEl.files[0]) pick(fileEl.files[0]); };
+
+function pick(f){
+  chosen = f;
+  baseName = f.name.replace(/\.[^.]+$/, "") || "transcript";
+  const mb = (f.size/1024/1024).toFixed(1);
+  fileInfo.textContent = `${f.name} · ${mb} MB`;
+  fileInfo.classList.add("show");
+  go.disabled = false;
+}
+
+/* ------------------------------------------------------------------ *
+ * MP3 frame splitting (pure JS, no re-encoding)
+ * Mirrors the tested Python implementation: walk frame headers, cut on
+ * frame boundaries so every chunk is a valid standalone MP3.
+ * ------------------------------------------------------------------ */
+const BITRATES = {
+  "3,1":[0,32,40,48,56,64,80,96,112,128,160,192,224,256,320,0],  // MPEG1 L3
+  "3,2":[0,32,48,56,64,80,96,112,128,160,192,224,256,320,384,0], // MPEG1 L2
+  "3,3":[0,32,64,96,128,160,192,224,256,288,320,352,384,416,448,0], // MPEG1 L1
+  "2,1":[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],      // MPEG2 L3
+  "2,2":[0,8,16,24,32,40,48,56,64,80,96,112,128,144,160,0],
+  "2,3":[0,32,48,56,64,80,96,112,128,144,160,176,192,224,256,0],
+};
+BITRATES["0,1"]=BITRATES["2,1"]; BITRATES["0,2"]=BITRATES["2,2"]; BITRATES["0,3"]=BITRATES["2,3"];
+const RATES = {3:[44100,48000,32000,0], 2:[22050,24000,16000,0], 0:[11025,12000,8000,0]};
+const SPF   = {"3,3":384,"3,2":1152,"3,1":1152,"2,3":384,"2,2":1152,"2,1":576,
+               "0,3":384,"0,2":1152,"0,1":576};
+
+function parseHeader(b, i){
+  if(i+4 > b.length) return null;
+  if(b[i] !== 0xFF || (b[i+1] & 0xE0) !== 0xE0) return null;
+  const ver = (b[i+1]>>3)&3, layer = (b[i+1]>>1)&3;
+  if(ver===1 || layer===0) return null;
+  const brIdx=(b[i+2]>>4)&15, srIdx=(b[i+2]>>2)&3, pad=(b[i+2]>>1)&1;
+  if(brIdx===0 || brIdx===15 || srIdx===3) return null;
+  const key = ver+","+layer;
+  const table = BITRATES[key]; if(!table) return null;
+  const br = table[brIdx]*1000, sr = RATES[ver][srIdx], spf = SPF[key];
+  if(!br || !sr) return null;
+  let len;
+  if(layer===3)                      len = Math.floor(12*br/sr + pad)*4;      // L1
+  else if(ver!==3 && layer===1)      len = Math.floor(72*br/sr) + pad;        // MPEG2/2.5 L3
+  else                               len = Math.floor(144*br/sr) + pad;       // L2 / MPEG1 L3
+  if(len < 4) return null;
+  return { len, dur: spf/sr };
+}
+
+function skipID3(b){
+  if(b.length>=10 && b[0]===0x49 && b[1]===0x44 && b[2]===0x33){
+    return 10 + ((b[6]&0x7F)<<21 | (b[7]&0x7F)<<14 | (b[8]&0x7F)<<7 | (b[9]&0x7F));
+  }
+  return 0;
+}
+
+/** Split into [{blob, dur}] each <= target bytes, on frame boundaries. */
+function splitMP3(bytes, target){
+  let i = skipID3(bytes), n = bytes.length;
+  const chunks = [];
+  let start = i, acc = 0, frames = 0;
+
+  while(i < n-4){
+    const f = parseHeader(bytes, i);
+    if(!f){                              // resync
+      let j = -1;
+      for(let k=i+1;k<n;k++){ if(bytes[k]===0xFF){ j=k; break; } }
+      if(j<0) break;
+      i = j; continue;
+    }
+    frames++;
+    if((i + f.len) - start > target && i > start){
+      chunks.push({ bytes: bytes.subarray(start, i), dur: acc });
+      start = i; acc = 0;
+    }
+    acc += f.dur;
+    i += f.len;
+  }
+  if(start < n) chunks.push({ bytes: bytes.subarray(start, n), dur: acc });
+  if(frames === 0) throw new Error("NOT_MP3");
+  return chunks;
+}
+
+/* ------------------------------------------------------------------ *
+ * Helpers
+ * ------------------------------------------------------------------ */
+const pad2 = v => String(v).padStart(2,"0");
+function fmtTs(sec){
+  const t = Math.floor(sec), h = Math.floor(t/3600), m = Math.floor((t%3600)/60), s = t%60;
+  return `[${pad2(h)}:${pad2(m)}:${pad2(s)}]`;
+}
+const sleep = ms => new Promise(r=>setTimeout(r,ms));
+
+async function callGroq(blob, name, apiKey){
+  for(let attempt=0; attempt<6; attempt++){
+    const fd = new FormData();
+    fd.append("file", blob, name);
+    fd.append("model", MODEL);
+    fd.append("response_format", "verbose_json");
+    fd.append("temperature", "0");
+    let res;
+    try{
+      res = await fetch(ENDPOINT, { method:"POST", headers:{Authorization:"Bearer "+apiKey}, body: fd });
+    }catch(e){ throw new Error("Network error — check your connection."); }
+
+    if(res.ok) return res.json();
+
+    if(res.status === 429){
+      const wait = Math.min(5 * 2**attempt, 60);
+      log(`  rate limited — waiting ${wait}s…`, "warn");
+      await sleep(wait*1000);
+      continue;
+    }
+    if(res.status === 401) throw new Error("Invalid API key (401). Check the key and try again.");
+    let detail = "";
+    try{ const j = await res.json(); detail = j.error?.message || ""; }catch(e){}
+    throw new Error(`Groq returned ${res.status}. ${detail}`);
+  }
+  throw new Error("Kept hitting rate limits. The free tier allows about 2 hours of audio per hour — try again later.");
+}
+
+/* ------------------------------------------------------------------ *
+ * Main
+ * ------------------------------------------------------------------ */
+go.onclick = async ()=>{
+  const apiKey = keyEl.value.trim();
+  if(!apiKey){ alert("Enter your Groq API key first."); keyEl.focus(); return; }
+  if(!chosen){ alert("Choose an audio file first."); return; }
+
+  go.disabled = true; go.textContent = "Working…";
+  logEl.innerHTML = ""; results.classList.remove("show");
+  setProgress(0.02);
+
+  try{
+    log(`Reading ${chosen.name} …`);
+    const buf   = await chosen.arrayBuffer();
+    const bytes = new Uint8Array(buf);
+    const mb    = bytes.length/1024/1024;
+    setProgress(0.08);
+
+    let parts;
+    if(bytes.length <= CHUNK_BYTES){
+      log(`${mb.toFixed(1)} MB — sending as one request.`);
+      parts = [{ bytes, dur: 0 }];
+    } else {
+      log(`${mb.toFixed(1)} MB — splitting locally…`);
+      try{
+        parts = splitMP3(bytes, CHUNK_BYTES);
+        log(`  split into ${parts.length} chunks`, "ok");
+      }catch(e){
+        throw new Error(
+          "This file is over 18 MB and isn't a parseable MP3, so it can't be split in the browser. " +
+          "Convert it to MP3 first, or use a shorter clip.");
+      }
+    }
+
+    const segs = [];
+    let offset = 0;
+    for(let i=0;i<parts.length;i++){
+      log(`Transcribing part ${i+1}/${parts.length} …`);
+      const blob = new Blob([parts[i].bytes], { type:"audio/mpeg" });
+      const json = await callGroq(blob, `part_${i}.mp3`, apiKey);
+
+      if(Array.isArray(json.segments) && json.segments.length){
+        for(const s of json.segments){
+          const txt = (s.text||"").trim();
+          if(txt) segs.push({ t:(s.start||0)+offset, txt });
+        }
+      } else if(json.text){
+        segs.push({ t: offset, txt: json.text.trim() });
+      }
+      offset += parts[i].dur;
+      setProgress(0.08 + 0.88 * (i+1)/parts.length);
+    }
+
+    if(!segs.length) throw new Error("No speech was detected in this file.");
+
+    tsText = segs.map(s => `${fmtTs(s.t)}  ${s.txt}`).join("\n");
+
+    // clean: flowing prose, paragraph break every 5 sentences
+    const joined = segs.map(s=>s.txt).join(" ").replace(/\s+/g," ").trim();
+    const sentences = joined.split(/(?<=[.!?])\s+/);
+    const paras=[]; let buf2=[];
+    for(const s of sentences){
+      buf2.push(s);
+      if(buf2.length>=5){ paras.push(buf2.join(" ")); buf2=[]; }
+    }
+    if(buf2.length) paras.push(buf2.join(" "));
+    cleanText = paras.join("\n\n");
+
+    setProgress(1);
+    log("Done.", "ok");
+    render();
+    results.classList.add("show");
+    results.scrollIntoView({ behavior:"smooth", block:"nearest" });
+
+  }catch(err){
+    log("ERROR: " + err.message, "err");
+  }finally{
+    go.disabled = false; go.textContent = "Transcribe";
+  }
+};
+
+/* ------------------------------------------------------------------ *
+ * Results view
+ * ------------------------------------------------------------------ */
+function render(){
+  out.textContent = view==="clean" ? cleanText : tsText;
+  out.classList.toggle("ts", view==="ts");
+}
+document.querySelectorAll(".tab").forEach(t=>{
+  t.onclick = ()=>{
+    document.querySelectorAll(".tab").forEach(x=>x.classList.remove("active"));
+    t.classList.add("active");
+    view = t.dataset.view;
+    render();
+  };
+});
+
+copyBtn.onclick = async ()=>{
+  const text = view==="clean" ? cleanText : tsText;
+  try{
+    await navigator.clipboard.writeText(text);
+    copyBtn.textContent = "Copied";
+  }catch(e){
+    const ta=document.createElement("textarea");
+    ta.value=text; document.body.appendChild(ta); ta.select();
+    document.execCommand("copy"); ta.remove();
+    copyBtn.textContent = "Copied";
+  }
+  setTimeout(()=>copyBtn.textContent="Copy", 1500);
+};
+
+function download(filename, content, mime){
+  const blob = new Blob([content], { type: mime });
+  const url  = URL.createObjectURL(blob);
+  const a    = document.createElement("a");
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(()=>URL.revokeObjectURL(url), 1000);
+}
+
+dlBtn.onclick = ()=>{
+  const suffix = view==="clean" ? "clean" : "timestamped";
+  download(`${baseName}_${suffix}.txt`,
+           view==="clean" ? cleanText : tsText,
+           "text/plain;charset=utf-8");
+};
+
+// Word-compatible HTML (.doc) — opens in Word and uploads to Google Docs cleanly
+dlDoc.onclick = ()=>{
+  const suffix = view==="clean" ? "clean" : "timestamped";
+  const body = (view==="clean" ? cleanText : tsText)
+    .split("\n")
+    .map(l => `<p>${l.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") || "&nbsp;"}</p>`)
+    .join("");
+  const html =
+    `<html xmlns:o="urn:schemas-microsoft-com:office:office" ` +
+    `xmlns:w="urn:schemas-microsoft-com:office:word" xmlns="http://www.w3.org/TR/REC-html40">` +
+    `<head><meta charset="utf-8"><title>${baseName}</title></head>` +
+    `<body style="font-family:Calibri,sans-serif;font-size:11pt;line-height:1.5">` +
+    `<h1 style="color:#1F3864">${baseName} — transcript</h1>${body}</body></html>`;
+  download(`${baseName}_${suffix}.doc`, html, "application/msword");
+};
+</script>
+</body>
+</html>
