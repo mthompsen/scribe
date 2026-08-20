@@ -131,7 +131,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.5.0-worker";   // bump on every change so builds are identifiable
+const VERSION     = "1.6.0-corematch";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -289,7 +289,7 @@ function skipID3(b){
  * ------------------------------------------------------------------ */
 const FFMPEG_VER  = "0.12.10";
 const UTIL_VER    = "0.12.1";
-const CORE_VER    = "0.12.6";
+const CORE_VER    = "0.12.10";   // must match FFMPEG_VER; skew causes silent init failure
 const CDN         = "https://unpkg.com";
 
 let _ffmpeg = null;
@@ -298,9 +298,12 @@ let _ffmpeg = null;
  *  Browsers refuse to start a Worker from a cross-origin script, so every
  *  piece ffmpeg loads at runtime must be rehosted this way. */
 async function toBlobURL(url, mime){
-  const res = await fetch(url);
-  if(!res.ok) throw new Error(`fetch ${res.status} for ${url}`);
+  let res;
+  try{ res = await fetch(url); }
+  catch(e){ throw new Error(`network error fetching ${url.split("/").pop()}: ${e.message}`); }
+  if(!res.ok) throw new Error(`HTTP ${res.status} fetching ${url.split("/").pop()}`);
   const buf = await res.arrayBuffer();
+  if(!buf.byteLength) throw new Error(`empty response for ${url.split("/").pop()}`);
   return URL.createObjectURL(new Blob([buf], { type: mime }));
 }
 
@@ -331,14 +334,25 @@ async function getFFmpeg(log){
   ff.on("log", ({ message }) => { if(/time=|size=/.test(message)) log("    " + message.trim()); });
 
   const coreBase = `${CDN}/@ffmpeg/core@${CORE_VER}/dist/umd`;
-  log("  fetching core…");
-  const [coreURL, wasmURL, classWorkerURL] = await Promise.all([
-    toBlobURL(`${coreBase}/ffmpeg-core.js`,   "text/javascript"),
-    toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm"),
-    toBlobURL(`${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, "text/javascript"),
-  ]);
 
-  await ff.load({ coreURL, wasmURL, classWorkerURL });
+  log("  fetching core js…");
+  const coreURL = await toBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript");
+
+  log("  fetching wasm (31 MB, this is the slow part)…");
+  const wasmURL = await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm");
+
+  log("  fetching worker…");
+  const classWorkerURL = await toBlobURL(
+    `${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, "text/javascript");
+
+  log("  initialising ffmpeg core…");
+  try{
+    await ff.load({ coreURL, wasmURL, classWorkerURL });
+  }catch(e){
+    console.error("ff.load failed:", e);
+    const d = (e && (e.message || e.name)) || JSON.stringify(e) || "core init returned no error detail";
+    throw new Error("ffmpeg core failed to initialise: " + d);
+  }
   _ffmpeg = ff;
   log("  converter ready", "ok");
   return ff;
@@ -525,6 +539,11 @@ async function callGroq(blob, name, apiKey){
 /* ------------------------------------------------------------------ *
  * Main
  * ------------------------------------------------------------------ */
+window.addEventListener("unhandledrejection", ev => {
+  console.error("unhandled rejection:", ev.reason);
+  try{ log("  (background error: " + ((ev.reason && ev.reason.message) || ev.reason) + ")", "warn"); }catch(e){}
+});
+
 go.onclick = async ()=>{
   const apiKey = keyEl.value.trim();
   if(!apiKey){ alert("Enter your Groq API key first."); keyEl.focus(); return; }
@@ -559,9 +578,12 @@ go.onclick = async ()=>{
       try{
         converted = await convertToMp3(chosen, log, p => setProgress(0.05 + 0.35 * p));
       }catch(e){
+        const detail = (e && (e.message || e.reason || e.name)) ||
+                       (typeof e === "string" ? e : JSON.stringify(e)) || "no detail";
+        console.error("conversion failure:", e);
         throw new Error(
           `This file is ${info.fmt.toUpperCase()}, not MP3, and automatic conversion failed ` +
-          `(${e.message}). Convert it manually with:\n\n` +
+          `(${detail}). Convert it manually with:\n\n` +
           `  ffmpeg -i "${chosen.name}" -codec:a libmp3lame -b:a 32k -ac 1 out.mp3\n\n` +
           `then upload out.mp3.`);
       }
