@@ -131,7 +131,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.6.0-corematch";   // bump on every change so builds are identifiable
+const VERSION     = "1.7.0-direct";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
@@ -335,24 +335,48 @@ async function getFFmpeg(log){
 
   const coreBase = `${CDN}/@ffmpeg/core@${CORE_VER}/dist/umd`;
 
-  log("  fetching core js…");
-  const coreURL = await toBlobURL(`${coreBase}/ffmpeg-core.js`, "text/javascript");
-
-  log("  fetching wasm (31 MB, this is the slow part)…");
-  const wasmURL = await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm");
-
+  // Only the worker script must be same-origin (browsers refuse cross-origin
+  // Workers). The core JS and wasm are fetched BY the worker, which is now
+  // same-origin, so they can point straight at the CDN. Handing the worker a
+  // blob: URL for the core breaks importScripts() and also breaks the core's
+  // relative lookup of its own .wasm file.
   log("  fetching worker…");
   const classWorkerURL = await toBlobURL(
     `${CDN}/@ffmpeg/ffmpeg@${FFMPEG_VER}/dist/umd/814.ffmpeg.js`, "text/javascript");
 
-  log("  initialising ffmpeg core…");
-  try{
-    await ff.load({ coreURL, wasmURL, classWorkerURL });
-  }catch(e){
-    console.error("ff.load failed:", e);
-    const d = (e && (e.message || e.name)) || JSON.stringify(e) || "core init returned no error detail";
-    throw new Error("ffmpeg core failed to initialise: " + d);
+  log("  initialising ffmpeg core (downloads ~31 MB on first run)…");
+
+  const attempts = [
+    { name: "direct CDN",  coreURL: `${coreBase}/ffmpeg-core.js`,
+                           wasmURL: `${coreBase}/ffmpeg-core.wasm` },
+    { name: "jsdelivr",    coreURL: `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VER}/dist/umd/ffmpeg-core.js`,
+                           wasmURL: `https://cdn.jsdelivr.net/npm/@ffmpeg/core@${CORE_VER}/dist/umd/ffmpeg-core.wasm` },
+    { name: "blob-hosted", blob: true },
+  ];
+
+  let lastErr = null;
+  for(const a of attempts){
+    try{
+      let coreURL = a.coreURL, wasmURL = a.wasmURL;
+      if(a.blob){
+        coreURL = await toBlobURL(`${coreBase}/ffmpeg-core.js`,   "text/javascript");
+        wasmURL = await toBlobURL(`${coreBase}/ffmpeg-core.wasm`, "application/wasm");
+      }
+      await ff.load({ coreURL, wasmURL, classWorkerURL });
+      log(`  core loaded (${a.name})`, "ok");
+      lastErr = null;
+      break;
+    }catch(e){
+      lastErr = e;
+      console.warn(`core load via ${a.name} failed:`, e);
+      log(`    ${a.name} failed, trying next…`, "warn");
+    }
   }
+  if(lastErr){
+    const d = (lastErr && (lastErr.message || lastErr.name)) || JSON.stringify(lastErr) || "no detail";
+    throw new Error("all core load strategies failed. Last error: " + d);
+  }
+
   _ffmpeg = ff;
   log("  converter ready", "ok");
   return ff;
