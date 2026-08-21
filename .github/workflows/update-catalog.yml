@@ -1,0 +1,46 @@
+name: Refresh StMU catalog
+
+on:
+  schedule:
+    - cron: "0 6 3 * *"   # monthly check at 06:00 UTC on the 3rd; commits only on real changes
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - name: Scrape the catalog
+        run: node scripts/scrape-catalog.js
+      - name: Commit if the catalog changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          # Ignore the "Generated <date>" header line so an unchanged catalog
+          # doesn't produce a commit every run.
+          if git diff -I '^// Generated' --quiet vendor/stmu-courses.js; then
+            echo "No catalog changes."
+            git checkout -- vendor/stmu-courses.js
+          else
+            node scripts/bump-version.js
+            git add vendor/stmu-courses.js index.html
+            git commit -m "chore: refresh StMU catalog ($(date +%F))"
+            git push
+          fi
+      - name: Keep the schedule alive on a quiet repo
+        # GitHub disables cron workflows after ~60 days without commits; a tiny
+        # empty commit before that threshold keeps the refresh running.
+        run: |
+          last=$(git log -1 --format=%ct)
+          age_days=$(( ( $(date +%s) - last ) / 86400 ))
+          echo "days since last commit: $age_days"
+          if [ "$age_days" -ge 50 ]; then
+            git commit --allow-empty -m "chore: keep scheduled catalog refresh active"
+            git push
+          fi
