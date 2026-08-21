@@ -110,9 +110,10 @@
   <details>
     <summary style="font-size:13px;font-weight:600;cursor:pointer">My courses — automatic filing</summary>
     <textarea id="courses" rows="5" spellcheck="false"
-      placeholder="TH 3301 — Systematic Theology&#10;PL 2310 — Ethics&#10;HS 1301 — Western Civilization"></textarea>
-    <div class="hint">One course per line: number and title. Saved transcripts are filed under the
-      matching course; with no list (or no match) they are filed by subject area instead.</div>
+      placeholder="TH 3301&#10;PL 2310&#10;HS 1301"></textarea>
+    <div class="hint">One course number per line — official titles fill in automatically from the
+      St.&nbsp;Mary's catalog. Saved transcripts are filed under the matching course; with no list
+      (or no match) the best-fitting catalog course or subject area is used instead.</div>
   </details>
 </div>
 
@@ -163,7 +164,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.10.0-courses";   // bump on every change so builds are identifiable
+const VERSION     = "1.11.0-catalog";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 const CHAT_MODEL  = "llama-3.3-70b-versatile";  // classification + key points (small calls)
 const CLEAN_MODEL = "llama-3.1-8b-instant";     // high-volume readability pass (bigger free limits)
@@ -240,6 +241,33 @@ try{ const k=localStorage.getItem("scribe_key"); if(k) keyEl.value=k; }catch(e){
 keyEl.addEventListener("input", ()=>{ try{ localStorage.setItem("scribe_key", keyEl.value.trim()); }catch(e){} });
 try{ const c=localStorage.getItem("scribe_courses"); if(c) coursesEl.value=c; }catch(e){}
 coursesEl.addEventListener("input", ()=>{ try{ localStorage.setItem("scribe_courses", coursesEl.value); }catch(e){} });
+
+/* Vendored StMU undergraduate course map (1,486 courses scraped from
+ * catalog.stmarytx.edu), loaded lazily on first use. */
+let _courseMap = null;
+async function getCourseMap(){
+  if(_courseMap) return _courseMap;
+  try{ await loadScript("vendor/stmu-courses.js"); _courseMap = window.STMU_COURSES || {}; }
+  catch(e){ console.warn("course map unavailable:", e); _courseMap = {}; }
+  return _courseMap;
+}
+
+// Normalize the roster on blur: "th3301" → "TH 3301 — Major Old Testament Themes"
+coursesEl.addEventListener("change", async ()=>{
+  const map = await getCourseMap();
+  if(!Object.keys(map).length) return;
+  const lines = coursesEl.value.split("\n").map(line=>{
+    const m = line.match(/^\s*([A-Za-z]{2,4})\s*-?\s*(\w{4})\b/);
+    if(!m) return line;
+    const code = m[1].toUpperCase() + " " + m[2].toUpperCase();
+    return map[code] ? `${code} — ${map[code]}` : line;
+  });
+  const v = lines.join("\n");
+  if(v !== coursesEl.value){
+    coursesEl.value = v;
+    try{ localStorage.setItem("scribe_courses", v); }catch(e){}
+  }
+});
 toggleKey.onclick = ()=>{
   const pw = keyEl.type==="password";
   keyEl.type = pw ? "text" : "password";
@@ -819,7 +847,7 @@ async function analyzeTranscript(){
   const roster = coursesEl.value.trim();
   const content =
     'You label transcripts for filing. Reply with JSON only, in this shape: ' +
-    '{"course": "..." | null, "courseTitle": "..." | null, "subject": "...", ' +
+    '{"course": "..." | null, "courseTitle": "..." | null, "prefix": "...", "subject": "...", ' +
     '"date": "YYYY-MM-DD" | null, "title": "..."}. ' +
     (roster
       ? 'The student\'s courses this semester are listed below, one per line as ' +
@@ -827,7 +855,8 @@ async function analyzeTranscript(){
         'of these courses, set "course" to its exact number and "courseTitle" to its exact ' +
         'title; otherwise set both to null.\n' + roster + '\n'
       : 'Set "course" and "courseTitle" to null. ') +
-    '"subject" is the best-fitting subject-area name from this list: ' + STMU_SUBJECTS + '. ' +
+    '"prefix" is the code and "subject" the name of the best-fitting subject area from ' +
+    'this list: ' + STMU_SUBJECTS + '. ' +
     '"date" is the date the recording was made ONLY if the transcript states or clearly ' +
     'implies it, else null. "title" is a concise descriptive title, at most 8 words, no quotes.';
   const raw = await callChat(CHAT_MODEL, [
@@ -960,11 +989,38 @@ dlOrg.onclick = async ()=>{
   if(!cleanText && !tsText){ alert("Transcribe something first."); return; }
   dlOrg.disabled = true; dlOrg.textContent = "Analyzing…";
   try{
-    let meta = { course: null, courseTitle: null, subject: "Uncategorized", date: null, title: baseName };
+    let meta = { course: null, courseTitle: null, prefix: "", subject: "Uncategorized", date: null, title: baseName };
     try{
       const a = await analyzeTranscript();
       if(a && typeof a === "object") meta = Object.assign(meta, a);
     }catch(e){ console.warn("transcript analysis failed, using fallbacks:", e); }
+
+    // No roster match: second, narrower pass over the catalog courses for the
+    // detected subject prefix (~30-130 options, a few KB), so the transcript
+    // still gets a best-guess course number. Picks are verified against the
+    // map so a hallucinated number can't create a bogus folder.
+    if(!meta.course){
+      try{
+        const map = await getCourseMap();
+        const prefix = String(meta.prefix||"").toUpperCase().replace(/[^A-Z]/g,"");
+        const opts = Object.entries(map).filter(([k]) => k.startsWith(prefix + " "));
+        if(prefix && opts.length){
+          const raw = await callChat(CHAT_MODEL, [
+            { role: "system", content:
+              'From the course list below, pick the single best matching course for this ' +
+              'lecture transcript. Reply with JSON only: {"course": "..." | null}. ' +
+              'Use the exact course number from the list; null if none is a clear match.\n' +
+              opts.map(([k,v]) => `${k} — ${v}`).join("\n") },
+            { role: "user", content: (cleanText || tsText).slice(0, 4000) },
+          ], true);
+          const pick = JSON.parse(raw);
+          if(pick && pick.course && map[pick.course]){
+            meta.course = pick.course;
+            meta.courseTitle = map[pick.course];
+          }
+        }
+      }catch(e){ console.warn("catalog course fallback failed:", e); }
+    }
 
     const subject = sanitizeName(meta.subject) || "Uncategorized";
     const course  = sanitizeName(meta.course);
