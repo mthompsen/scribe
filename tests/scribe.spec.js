@@ -175,12 +175,13 @@ test.describe("organized save + library + zip export", () => {
     const { execSync } = require("child_process");
     const { errors } = await instrument(page);
 
-    // First analysis call matches an enrolled course; second matches none.
+    // First analysis call matches an enrolled course; second matches none and
+    // must fall through to the two-stage catalog lookup (prefix → course).
     const labels = [
-      { course: "TH 3301", courseTitle: "Systematic Theology", subject: "Theology",
-        date: "2026-03-14", title: "Grace and Free Will" },
-      { course: null, courseTitle: null, subject: "History",
-        date: "2026-02-02", title: "The Fall of Rome" },
+      { course: "TH 3301", courseTitle: "Major Old Testament Themes", subject: "Theology",
+        prefix: "TH", date: "2026-03-14", title: "Grace and Free Will" },
+      { course: null, courseTitle: null, subject: "Computer Science",
+        prefix: "CS", date: "2026-02-02", title: "The Fall of Rome" },
     ];
     let call = 0;
     await page.route("https://api.groq.com/openai/v1/chat/completions", (route) => {
@@ -188,8 +189,11 @@ test.describe("organized save + library + zip export", () => {
       const sys = body.messages[0].content;
       let content;
       if (sys.includes("label transcripts")) {
-        expect(sys).toContain("TH 3301 — Systematic Theology"); // roster reaches the classifier
+        expect(sys).toContain("TH 3301 — Major Old Testament Themes"); // normalized roster reaches the classifier
         content = JSON.stringify(labels[Math.min(call++, 1)]);
+      } else if (sys.includes("pick the single best matching course")) {
+        expect(sys).toContain("CS 1310 — Programming I in C"); // real vendored catalog reaches stage 2
+        content = JSON.stringify({ course: "CS 1310" });
       } else if (sys.includes("readability")) {
         content = "== Introduction ==\n\nCleaned for clarity: " + body.messages[1].content;
       } else {
@@ -205,9 +209,13 @@ test.describe("organized save + library + zip export", () => {
     await start(page, "fixture-small.mp3");
     await expect(page.locator("#log")).toContainText("Done.", { timeout: 60_000 });
 
-    // course roster for automatic filing (inside a collapsed <details>)
+    // course roster (inside a collapsed <details>): bare numbers normalize to
+    // official catalog titles on blur
     await page.click("summary:has-text('My courses')");
-    await page.fill("#courses", "TH 3301 — Systematic Theology\nPL 2310 — Ethics");
+    await page.fill("#courses", "th3301\npl 2310");
+    await page.locator("#courses").blur();
+    await expect(page.locator("#courses")).toHaveValue(
+      "TH 3301 — Major Old Testament Themes\nPL 2310 — Symbolic Logic");
 
     // readability pass rewrites the clean view
     await page.click("#enhance");
@@ -221,7 +229,7 @@ test.describe("organized save + library + zip export", () => {
     await page.click("#dlOrg");
     await expect(page.locator("#library")).toBeVisible();
     await expect(page.locator(".libGroup")).toHaveText(
-      ["History", "TH 3301 — Systematic Theology"]); // sorted
+      ["CS 1310 — Programming I in C", "TH 3301 — Major Old Testament Themes"]); // sorted
     await expect(page.locator(".libItem")).toHaveCount(2);
 
     // archive survives a reload (IndexedDB)
@@ -241,7 +249,7 @@ test.describe("organized save + library + zip export", () => {
     expect(itemDl.suggestedFilename()).toBe("2026-02-02 — The Fall of Rome.html");
     const html = fs.readFileSync(await itemDl.path(), "utf8");
     expect(html).toContain("The Fall of Rome");
-    expect(html).toContain("History");
+    expect(html).toContain("CS 1310 — Programming I in C");
     expect(html).toContain("Hello from the stub.");
     expect(html).toContain("<h2>Introduction</h2>");
     expect(html).toContain("Key point one");
@@ -254,8 +262,8 @@ test.describe("organized save + library + zip export", () => {
     expect(zipDl.suggestedFilename()).toMatch(/^Transcriptions \d{4}-\d{2}-\d{2}\.zip$/);
     const zipPath = await zipDl.path();
     const listing = execSync(`unzip -l "${zipPath}"`, { encoding: "utf8" });
-    expect(listing).toContain("Transcriptions/TH 3301 — Systematic Theology/2026-03-14 — Grace and Free Will.html");
-    expect(listing).toContain("Transcriptions/History/2026-02-02 — The Fall of Rome.html");
+    expect(listing).toContain("Transcriptions/TH 3301 — Major Old Testament Themes/2026-03-14 — Grace and Free Will.html");
+    expect(listing).toContain("Transcriptions/CS 1310 — Programming I in C/2026-02-02 — The Fall of Rome.html");
     execSync(`unzip -t "${zipPath}"`); // CRC check — throws on a corrupt archive
 
     expect(errors).toEqual([]);
