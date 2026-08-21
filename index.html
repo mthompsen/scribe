@@ -164,10 +164,12 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.11.0-catalog";   // bump on every change so builds are identifiable
+const VERSION     = "1.11.1-models";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
-const CHAT_MODEL  = "llama-3.3-70b-versatile";  // classification + key points (small calls)
-const CLEAN_MODEL = "llama-3.1-8b-instant";     // high-volume readability pass (bigger free limits)
+// Groq retires chat model IDs regularly (the llama-3.x ids 404 now), so each
+// role has a fallback chain tried in order; dead models are skipped per session.
+const SMART_MODELS = ["openai/gpt-oss-120b", "openai/gpt-oss-20b"];  // classification + key points
+const FAST_MODELS  = ["openai/gpt-oss-20b", "openai/gpt-oss-120b"];  // high-volume readability pass
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
 const CHAT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
@@ -801,8 +803,12 @@ const fmtDate = ms => {
   return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
 };
 
-/** Chat completion with the same 429 backoff discipline as transcription. */
-async function callChat(model, messages, wantJson){
+/** Chat completion with the same 429 backoff discipline as transcription,
+ *  falling through a model list so a decommissioned model id degrades
+ *  gracefully instead of failing the feature. */
+const _deadModels = new Set();
+
+async function callChatModel(model, messages, wantJson){
   const apiKey = keyEl.value.trim();
   for(let attempt=0; attempt<6; attempt++){
     let res;
@@ -819,15 +825,41 @@ async function callChat(model, messages, wantJson){
       const j = await res.json();
       return j.choices[0].message.content;
     }
+    let detail = "";
+    try{ const j = await res.json(); detail = j.error?.message || ""; }catch(e){}
     if(res.status === 429){
       const wait = Math.min(5 * 2**attempt, 60);
       log(`  rate limited — waiting ${wait}s…`, "warn");
       await sleep(wait*1000);
       continue;
     }
-    throw new Error("chat request failed (HTTP " + res.status + ")");
+    if(res.status === 404 || (res.status === 400 && /model|decommission|deprecat/i.test(detail))){
+      const err = new Error(`model ${model} unavailable (HTTP ${res.status}${detail ? ": " + detail : ""})`);
+      err.modelUnavailable = true;
+      throw err;
+    }
+    throw new Error(`chat request failed (HTTP ${res.status}${detail ? ": " + detail : ""})`);
   }
   throw new Error("kept hitting rate limits — try again in a few minutes.");
+}
+
+async function callChat(models, messages, wantJson){
+  let lastErr = null;
+  for(const model of models){
+    if(_deadModels.has(model)) continue;
+    try{
+      return await callChatModel(model, messages, wantJson);
+    }catch(e){
+      if(e && e.modelUnavailable){
+        console.warn(e.message + " — trying next model");
+        _deadModels.add(model);
+        lastErr = e;
+        continue;
+      }
+      throw e;
+    }
+  }
+  throw new Error("no available chat model" + (lastErr ? " — " + lastErr.message : ""));
 }
 
 // St. Mary's University (StMU) course subject prefixes, from the official
@@ -859,7 +891,7 @@ async function analyzeTranscript(){
     'this list: ' + STMU_SUBJECTS + '. ' +
     '"date" is the date the recording was made ONLY if the transcript states or clearly ' +
     'implies it, else null. "title" is a concise descriptive title, at most 8 words, no quotes.';
-  const raw = await callChat(CHAT_MODEL, [
+  const raw = await callChat(SMART_MODELS, [
     { role: "system", content },
     { role: "user", content: (cleanText || tsText).slice(0, 6000) },
   ], true);
@@ -909,7 +941,7 @@ enhanceBtn.onclick = async ()=>{
     const parts = [];
     for(let i=0; i<chunks.length; i++){
       enhanceBtn.textContent = `Enhancing ${i+1}/${chunks.length}…`;
-      parts.push((await callChat(CLEAN_MODEL, [
+      parts.push((await callChat(FAST_MODELS, [
         { role: "system", content: sys },
         { role: "user", content: chunks[i] },
       ], false)).trim());
@@ -917,7 +949,7 @@ enhanceBtn.onclick = async ()=>{
     cleanText = parts.join("\n\n");
     enhanceBtn.textContent = "Summarizing…";
     try{
-      keyPoints = (await callChat(CHAT_MODEL, [
+      keyPoints = (await callChat(SMART_MODELS, [
         { role: "system", content:
           'Extract the 5-10 most important points from this lecture transcript as short ' +
           'bullet lines, each starting with "- ". Reply with the bullets only.' },
@@ -1005,7 +1037,7 @@ dlOrg.onclick = async ()=>{
         const prefix = String(meta.prefix||"").toUpperCase().replace(/[^A-Z]/g,"");
         const opts = Object.entries(map).filter(([k]) => k.startsWith(prefix + " "));
         if(prefix && opts.length){
-          const raw = await callChat(CHAT_MODEL, [
+          const raw = await callChat(SMART_MODELS, [
             { role: "system", content:
               'From the course list below, pick the single best matching course for this ' +
               'lecture transcript. Reply with JSON only: {"course": "..." | null}. ' +

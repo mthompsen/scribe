@@ -184,8 +184,21 @@ test.describe("organized save + library + zip export", () => {
         prefix: "CS", date: "2026-02-02", title: "The Fall of Rome" },
     ];
     let call = 0;
+    let firstChatCall = true;
+    const modelsSeen = new Set();
     await page.route("https://api.groq.com/openai/v1/chat/completions", (route) => {
       const body = JSON.parse(route.request().postData());
+      modelsSeen.add(body.model);
+      // Simulate a decommissioned model on the very first call: the app must
+      // fall through to its next model instead of failing the feature.
+      if (firstChatCall) {
+        firstChatCall = false;
+        return route.fulfill({
+          status: 404,
+          contentType: "application/json",
+          body: JSON.stringify({ error: { message: `The model \`${body.model}\` does not exist` } }),
+        });
+      }
       const sys = body.messages[0].content;
       let content;
       if (sys.includes("label transcripts")) {
@@ -266,6 +279,10 @@ test.describe("organized save + library + zip export", () => {
     expect(listing).toContain("Transcriptions/CS 1310 — Programming I in C/2026-02-02 — The Fall of Rome.html");
     execSync(`unzip -t "${zipPath}"`); // CRC check — throws on a corrupt archive
 
-    expect(errors).toEqual([]);
+    // the 404'd model was replaced by a fallback model
+    expect(modelsSeen.size).toBeGreaterThan(1);
+    // Chrome logs its own console error for the deliberately simulated 404;
+    // nothing else may error.
+    expect(errors.filter((e) => !/status of 404/.test(e))).toEqual([]);
   });
 });
