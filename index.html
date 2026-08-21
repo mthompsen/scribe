@@ -84,6 +84,10 @@
   .libItem .name:hover{color:var(--accent)}
   .libItem .date{font-family:var(--mono);font-size:11.5px;color:var(--muted);flex:0 0 auto}
   .libItem button{padding:5px 9px;font-size:12px;flex:0 0 auto}
+  textarea{width:100%;background:#0d1117;border:1px solid var(--border);border-radius:8px;
+           color:var(--text);padding:10px;font-size:14px;font-family:var(--mono);
+           margin-top:10px;resize:vertical}
+  textarea:focus{outline:none;border-color:var(--accent)}
 </style>
 </head>
 <body>
@@ -100,6 +104,16 @@
   </div>
   <div class="hint">Stored only in this browser (localStorage), never sent anywhere except Groq.
     Get one free at <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a>.</div>
+</div>
+
+<div class="panel">
+  <details>
+    <summary style="font-size:13px;font-weight:600;cursor:pointer">My courses — automatic filing</summary>
+    <textarea id="courses" rows="5" spellcheck="false"
+      placeholder="TH 3301 — Systematic Theology&#10;PL 2310 — Ethics&#10;HS 1301 — Western Civilization"></textarea>
+    <div class="hint">One course per line: number and title. Saved transcripts are filed under the
+      matching course; with no list (or no match) they are filed by subject area instead.</div>
+  </details>
 </div>
 
 <div class="drop" id="drop">
@@ -122,6 +136,7 @@
   <div id="out"></div>
   <div class="actions">
     <button id="copy">Copy</button>
+    <button id="enhance">Enhance ✦</button>
     <button id="dl">Download .txt</button>
     <button id="dlDoc">Download .doc</button>
     <button id="dlOrg">Save organized</button>
@@ -148,9 +163,10 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.9.0-library";   // bump on every change so builds are identifiable
+const VERSION     = "1.10.0-courses";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
-const CHAT_MODEL  = "llama-3.3-70b-versatile";
+const CHAT_MODEL  = "llama-3.3-70b-versatile";  // classification + key points (small calls)
+const CLEAN_MODEL = "llama-3.1-8b-instant";     // high-volume readability pass (bigger free limits)
 const CHUNK_BYTES = 18 * 1024 * 1024;   // safely under Groq's 25 MB request cap
 const ENDPOINT    = "https://api.groq.com/openai/v1/audio/transcriptions";
 const CHAT_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
@@ -162,9 +178,9 @@ const $ = id => document.getElementById(id);
 const keyEl=$("key"), toggleKey=$("toggleKey"), drop=$("drop"), fileEl=$("file"),
       fileInfo=$("fileInfo"), go=$("go"), bar=$("bar"), logEl=$("log"),
       results=$("results"), out=$("out"), copyBtn=$("copy"), dlBtn=$("dl"),
-      dlDoc=$("dlDoc"), dlOrg=$("dlOrg");
+      dlDoc=$("dlDoc"), dlOrg=$("dlOrg"), enhanceBtn=$("enhance"), coursesEl=$("courses");
 
-let chosen=null, cleanText="", tsText="", view="clean", baseName="transcript";
+let chosen=null, cleanText="", tsText="", keyPoints="", view="clean", baseName="transcript";
 
 /* ------------------------------------------------------------------ *
  * Version stamp + environment diagnostics
@@ -222,6 +238,8 @@ try{ (function(){
  * ------------------------------------------------------------------ */
 try{ const k=localStorage.getItem("scribe_key"); if(k) keyEl.value=k; }catch(e){}
 keyEl.addEventListener("input", ()=>{ try{ localStorage.setItem("scribe_key", keyEl.value.trim()); }catch(e){} });
+try{ const c=localStorage.getItem("scribe_courses"); if(c) coursesEl.value=c; }catch(e){}
+coursesEl.addEventListener("input", ()=>{ try{ localStorage.setItem("scribe_courses", coursesEl.value); }catch(e){} });
 toggleKey.onclick = ()=>{
   const pw = keyEl.type==="password";
   keyEl.type = pw ? "text" : "password";
@@ -565,6 +583,7 @@ go.onclick = async ()=>{
   if(!chosen){ alert("Choose an audio file first."); return; }
 
   go.disabled = true; go.textContent = "Working…";
+  keyPoints = ""; enhanceBtn.textContent = "Enhance ✦"; enhanceBtn.disabled = false;
   logEl.innerHTML = ""; results.classList.remove("show");
   setProgress(0.02);
 
@@ -754,36 +773,150 @@ const fmtDate = ms => {
   return `${d.getFullYear()}-${pad2(d.getMonth()+1)}-${pad2(d.getDate())}`;
 };
 
-async function analyzeTranscript(apiKey){
-  const res = await fetch(CHAT_ENDPOINT, {
-    method: "POST",
-    headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: CHAT_MODEL,
-      temperature: 0,
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content:
-          'You label transcripts for filing. Reply with JSON only, in this shape: ' +
-          '{"subject": "...", "date": "YYYY-MM-DD" | null, "title": "..."}. ' +
-          '"subject" is a short academic subject-area label suitable as a folder name ' +
-          '(e.g. "Theology", "Philosophy", "History", "Biology", "Computer Science", ' +
-          '"Business", "Law", "Literature") — pick the best fit for the content. ' +
-          '"date" is the date the recording was made ONLY if the transcript states or ' +
-          'clearly implies it, else null. "title" is a concise descriptive title, ' +
-          'at most 8 words, no quotes.' },
-        { role: "user", content: (cleanText || tsText).slice(0, 6000) }
-      ]
-    })
-  });
-  if(!res.ok) throw new Error("analysis request failed (HTTP " + res.status + ")");
-  const j = await res.json();
-  return JSON.parse(j.choices[0].message.content);
+/** Chat completion with the same 429 backoff discipline as transcription. */
+async function callChat(model, messages, wantJson){
+  const apiKey = keyEl.value.trim();
+  for(let attempt=0; attempt<6; attempt++){
+    let res;
+    try{
+      res = await fetch(CHAT_ENDPOINT, {
+        method: "POST",
+        headers: { "Authorization": "Bearer " + apiKey, "Content-Type": "application/json" },
+        body: JSON.stringify(Object.assign(
+          { model, temperature: 0, messages },
+          wantJson ? { response_format: { type: "json_object" } } : {})),
+      });
+    }catch(e){ throw new Error("Network error — check your connection."); }
+    if(res.ok){
+      const j = await res.json();
+      return j.choices[0].message.content;
+    }
+    if(res.status === 429){
+      const wait = Math.min(5 * 2**attempt, 60);
+      log(`  rate limited — waiting ${wait}s…`, "warn");
+      await sleep(wait*1000);
+      continue;
+    }
+    throw new Error("chat request failed (HTTP " + res.status + ")");
+  }
+  throw new Error("kept hitting rate limits — try again in a few minutes.");
 }
 
-function prettyHtml(subject, date, title, clean, ts){
+// St. Mary's University (StMU) course subject prefixes, from the official
+// catalog (catalog.stmarytx.edu). Used as the fallback taxonomy when the
+// transcript matches none of the user's listed courses.
+const STMU_SUBJECTS =
+  "AC Accounting, AN Anthropology, AB Arabic, AR Art, BIO Bioinformatics, BL Biology, " +
+  "BA Business Administration, CH Chemistry, CM Communication Studies, CS Computer Science, " +
+  "CJ Criminal Justice, CR Criminology, DM Drama, EC Economics, ED Education, EG Engineering, " +
+  "EN English, ES Environmental Science, EX Exercise & Sports Science, FN Finance, FR French, " +
+  "FSC Forensic Science, GR German, GK Greek, HS History, HU Humanities, QM Information Systems, " +
+  "IB International Business, MN Management, MK Marketing, MT Mathematics, MU Music, NU Nursing, " +
+  "PL Philosophy, PE Physical Education, PY Physics, PO Political Science, PS Psychology, " +
+  "CPH Public Health, SC Sociology, SP Spanish, TH Theology";
+
+async function analyzeTranscript(){
+  const roster = coursesEl.value.trim();
+  const content =
+    'You label transcripts for filing. Reply with JSON only, in this shape: ' +
+    '{"course": "..." | null, "courseTitle": "..." | null, "subject": "...", ' +
+    '"date": "YYYY-MM-DD" | null, "title": "..."}. ' +
+    (roster
+      ? 'The student\'s courses this semester are listed below, one per line as ' +
+        '"NUMBER — Title". If the transcript is clearly a lecture or discussion from one ' +
+        'of these courses, set "course" to its exact number and "courseTitle" to its exact ' +
+        'title; otherwise set both to null.\n' + roster + '\n'
+      : 'Set "course" and "courseTitle" to null. ') +
+    '"subject" is the best-fitting subject-area name from this list: ' + STMU_SUBJECTS + '. ' +
+    '"date" is the date the recording was made ONLY if the transcript states or clearly ' +
+    'implies it, else null. "title" is a concise descriptive title, at most 8 words, no quotes.';
+  const raw = await callChat(CHAT_MODEL, [
+    { role: "system", content },
+    { role: "user", content: (cleanText || tsText).slice(0, 6000) },
+  ], true);
+  return JSON.parse(raw);
+}
+
+/* ------------------------------------------------------------------ *
+ * Readability pass: chunked cleanup on a fast model (punctuation,
+ * fillers, false starts, paragraphs, section headings, misheard terms),
+ * then one small call for a key-points summary. Sequential and chunked
+ * so memory stays flat on phones and free-tier limits are respected.
+ * ------------------------------------------------------------------ */
+const CLEAN_PROMPT =
+  "You improve the readability of a university lecture transcript. " +
+  "Fix punctuation, capitalisation and sentence boundaries. Remove filler words " +
+  "(um, uh, like, you know), false starts and immediate repetitions. Break the text " +
+  "into paragraphs at topic shifts. Where a clearly new section begins, insert a short " +
+  "heading on its own line formatted exactly as: == Heading ==. Correct obviously " +
+  "misheard technical terms and proper names from context. Do NOT paraphrase, " +
+  "summarise, reorder, drop content, or add commentary. Reply with the cleaned text only.";
+
+function chunkText(t, max){
+  const chunks = [];
+  let cur = "";
+  for(let p of t.split("\n\n")){
+    while(p.length > max){
+      if(cur){ chunks.push(cur); cur = ""; }
+      chunks.push(p.slice(0, max));
+      p = p.slice(max);
+    }
+    if(cur && cur.length + p.length + 2 > max){ chunks.push(cur); cur = ""; }
+    if(p) cur = cur ? cur + "\n\n" + p : p;
+  }
+  if(cur) chunks.push(cur);
+  return chunks;
+}
+
+enhanceBtn.onclick = async ()=>{
+  if(!cleanText){ alert("Transcribe something first."); return; }
+  if(!keyEl.value.trim()){ alert("Enter your Groq API key first."); keyEl.focus(); return; }
+  enhanceBtn.disabled = true;
+  try{
+    const roster = coursesEl.value.trim();
+    const sys = CLEAN_PROMPT +
+      (roster ? "\nContext — the student's courses this semester:\n" + roster : "");
+    const chunks = chunkText(cleanText, 9000);
+    const parts = [];
+    for(let i=0; i<chunks.length; i++){
+      enhanceBtn.textContent = `Enhancing ${i+1}/${chunks.length}…`;
+      parts.push((await callChat(CLEAN_MODEL, [
+        { role: "system", content: sys },
+        { role: "user", content: chunks[i] },
+      ], false)).trim());
+    }
+    cleanText = parts.join("\n\n");
+    enhanceBtn.textContent = "Summarizing…";
+    try{
+      keyPoints = (await callChat(CHAT_MODEL, [
+        { role: "system", content:
+          'Extract the 5-10 most important points from this lecture transcript as short ' +
+          'bullet lines, each starting with "- ". Reply with the bullets only.' },
+        { role: "user", content: cleanText.slice(0, 24000) },
+      ], false)).trim();
+    }catch(e){ console.warn("key-points summary failed (non-fatal):", e); }
+    view = "clean"; render();
+    document.querySelectorAll(".tab").forEach(x=>x.classList.toggle("active", x.dataset.view==="clean"));
+    log("Enhanced for readability.", "ok");
+    enhanceBtn.textContent = "Enhanced ✓";
+  }catch(e){
+    alert("Enhance failed: " + e.message);
+    enhanceBtn.textContent = "Enhance ✦";
+    enhanceBtn.disabled = false;
+  }
+};
+
+function prettyHtml(group, date, title, clean, ts, points){
   const esc = s => s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-  const paras = clean.split("\n\n").map(p => `<p>${esc(p)}</p>`).join("\n");
+  const paras = clean.split("\n\n").map(p => {
+    const h = p.match(/^==\s*(.+?)\s*==$/);
+    return h ? `<h2>${esc(h[1])}</h2>` : `<p>${esc(p)}</p>`;
+  }).join("\n");
+  const kp = (points||"").trim()
+    ? `<section class="kp"><h2>Key points</h2><ul>${
+        points.split("\n").map(l=>l.replace(/^-\s*/,"").trim()).filter(Boolean)
+              .map(l=>`<li>${esc(l)}</li>`).join("")}</ul></section>`
+    : "";
   const tsRows = ts.split("\n").map(l => {
     const m = l.match(/^(\[[\d:]+\])\s+(.*)$/);
     return m ? `<tr><td class="t">${esc(m[1])}</td><td>${esc(m[2])}</td></tr>` : "";
@@ -800,6 +933,12 @@ function prettyHtml(subject, date, title, clean, ts){
   .meta{font-family:system-ui,sans-serif;font-size:.85em;color:#555;
         text-transform:uppercase;letter-spacing:.06em}
   p{margin:0 0 1.1em;text-align:justify}
+  h2{font-size:1.15em;margin:1.6em 0 .5em}
+  .kp{background:#f4f1e8;border:1px solid #ddd6c3;border-radius:6px;
+      padding:.8em 1.2em;margin-bottom:2em;font-family:system-ui,sans-serif;font-size:.92em}
+  .kp h2{margin:.2em 0 .5em;font-size:1em;text-transform:uppercase;letter-spacing:.06em}
+  .kp ul{margin:0;padding-left:1.2em}
+  .kp li{margin-bottom:.35em}
   details{margin-top:2.5em;font-family:system-ui,sans-serif;font-size:.9em}
   summary{cursor:pointer;font-weight:600;margin-bottom:.8em}
   table{border-collapse:collapse;width:100%}
@@ -809,8 +948,9 @@ function prettyHtml(subject, date, title, clean, ts){
 </style></head><body>
 <header>
   <h1>${esc(title)}</h1>
-  <div class="meta">${esc(subject)} &middot; ${esc(date)}</div>
+  <div class="meta">${esc(group)} &middot; ${esc(date)}</div>
 </header>
+${kp}
 ${paras}
 <details><summary>Timestamped transcript</summary><table>${tsRows}</table></details>
 </body></html>`;
@@ -820,21 +960,26 @@ dlOrg.onclick = async ()=>{
   if(!cleanText && !tsText){ alert("Transcribe something first."); return; }
   dlOrg.disabled = true; dlOrg.textContent = "Analyzing…";
   try{
-    let meta = { subject: "Uncategorized", date: null, title: baseName };
+    let meta = { course: null, courseTitle: null, subject: "Uncategorized", date: null, title: baseName };
     try{
-      const a = await analyzeTranscript(keyEl.value.trim());
+      const a = await analyzeTranscript();
       if(a && typeof a === "object") meta = Object.assign(meta, a);
     }catch(e){ console.warn("transcript analysis failed, using fallbacks:", e); }
 
     const subject = sanitizeName(meta.subject) || "Uncategorized";
+    const course  = sanitizeName(meta.course);
+    // File under the matched course number when there is one, else by subject.
+    const group   = course
+      ? (course + (meta.courseTitle ? " — " + sanitizeName(meta.courseTitle) : ""))
+      : subject;
     const date    = /^\d{4}-\d{2}-\d{2}$/.test(meta.date||"") ? meta.date
                     : fmtDate(chosen ? chosen.lastModified : Date.now());
     const title   = sanitizeName(meta.title) || baseName;
 
     await dbPut({
-      subject, date, title,
-      clean: cleanText, ts: tsText,
-      html: prettyHtml(subject, date, title, cleanText, tsText),
+      group, subject, date, title,
+      clean: cleanText, ts: tsText, keyPoints,
+      html: prettyHtml(group, date, title, cleanText, tsText, keyPoints),
       source: chosen ? chosen.name : "", createdAt: Date.now(),
     });
     await renderLibrary();
@@ -890,23 +1035,24 @@ async function renderLibrary(){
   try{ recs = await dbAll(); }catch(e){ console.warn("library unavailable:", e); return; }
   libPanel.style.display = recs.length ? "block" : "none";
   libList.innerHTML = "";
-  const bySubject = new Map();
+  const byGroup = new Map();
   for(const r of recs){
-    if(!bySubject.has(r.subject)) bySubject.set(r.subject, []);
-    bySubject.get(r.subject).push(r);
+    const key = r.group || r.subject;
+    if(!byGroup.has(key)) byGroup.set(key, []);
+    byGroup.get(key).push(r);
   }
-  for(const subject of [...bySubject.keys()].sort()){
+  for(const groupName of [...byGroup.keys()].sort()){
     const g = document.createElement("div");
-    g.className = "libGroup"; g.textContent = subject;
+    g.className = "libGroup"; g.textContent = groupName;
     libList.appendChild(g);
-    const items = bySubject.get(subject).sort((a,b)=> (b.date||"").localeCompare(a.date||""));
+    const items = byGroup.get(groupName).sort((a,b)=> (b.date||"").localeCompare(a.date||""));
     for(const r of items){
       const row = document.createElement("div");
       row.className = "libItem";
       const name = document.createElement("span");
       name.className = "name"; name.textContent = r.title; name.title = "View";
       name.onclick = ()=>{
-        cleanText = r.clean; tsText = r.ts; baseName = r.title;
+        cleanText = r.clean; tsText = r.ts; keyPoints = r.keyPoints || ""; baseName = r.title;
         render(); results.classList.add("show");
         results.scrollIntoView({ behavior:"smooth", block:"nearest" });
       };
@@ -975,8 +1121,9 @@ zipAll.onclick = async ()=>{
   if(!recs.length) return;
   const enc = new TextEncoder(), seen = new Set(), entries = [];
   for(const r of recs){
-    let path = `Transcriptions/${r.subject}/${r.date} — ${r.title}.html`, i = 2;
-    while(seen.has(path)) path = `Transcriptions/${r.subject}/${r.date} — ${r.title} (${i++}).html`;
+    const g = r.group || r.subject;
+    let path = `Transcriptions/${g}/${r.date} — ${r.title}.html`, i = 2;
+    while(seen.has(path)) path = `Transcriptions/${g}/${r.date} — ${r.title} (${i++}).html`;
     seen.add(path);
     entries.push({ path, data: enc.encode(r.html) });
   }
