@@ -1,6 +1,6 @@
 // St. Mary's University (San Antonio) undergraduate course map.
-// Generated 2026-08-20 from https://catalog.stmarytx.edu/undergraduate/course-descriptions/
-// 1486 courses. Regenerate by re-running the scrape in BRIEF-era tooling.
+// Generated 2026-08-21 from https://catalog.stmarytx.edu/undergraduate/course-descriptions/
+// 1486 courses. Regenerate with: node scripts/scrape-catalog.js
 window.STMU_COURSES = {
 "AB 1311":"Introduction to Arabic I",
 "AB 1312":"Introduction to Arabic II",
