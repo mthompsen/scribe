@@ -175,30 +175,53 @@ test.describe("organized save + library + zip export", () => {
     const { execSync } = require("child_process");
     const { errors } = await instrument(page);
 
-    // First analysis call labels Theology, second labels History.
+    // First analysis call matches an enrolled course; second matches none.
     const labels = [
-      { subject: "Theology", date: "2026-03-14", title: "Grace and Free Will" },
-      { subject: "History", date: "2026-02-02", title: "The Fall of Rome" },
+      { course: "TH 3301", courseTitle: "Systematic Theology", subject: "Theology",
+        date: "2026-03-14", title: "Grace and Free Will" },
+      { course: null, courseTitle: null, subject: "History",
+        date: "2026-02-02", title: "The Fall of Rome" },
     ];
     let call = 0;
-    await page.route("https://api.groq.com/openai/v1/chat/completions", (route) =>
+    await page.route("https://api.groq.com/openai/v1/chat/completions", (route) => {
+      const body = JSON.parse(route.request().postData());
+      const sys = body.messages[0].content;
+      let content;
+      if (sys.includes("label transcripts")) {
+        expect(sys).toContain("TH 3301 — Systematic Theology"); // roster reaches the classifier
+        content = JSON.stringify(labels[Math.min(call++, 1)]);
+      } else if (sys.includes("readability")) {
+        content = "== Introduction ==\n\nCleaned for clarity: " + body.messages[1].content;
+      } else {
+        content = "- Key point one\n- Key point two";
+      }
       route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({
-          choices: [{ message: { content: JSON.stringify(labels[Math.min(call++, 1)]) } }],
-        }),
-      }));
+        body: JSON.stringify({ choices: [{ message: { content } }] }),
+      });
+    });
 
     await start(page, "fixture-small.mp3");
     await expect(page.locator("#log")).toContainText("Done.", { timeout: 60_000 });
 
-    // save twice → two subject groups in the library
+    // course roster for automatic filing (inside a collapsed <details>)
+    await page.click("summary:has-text('My courses')");
+    await page.fill("#courses", "TH 3301 — Systematic Theology\nPL 2310 — Ethics");
+
+    // readability pass rewrites the clean view
+    await page.click("#enhance");
+    await expect(page.locator("#enhance")).toHaveText("Enhanced ✓");
+    await expect(page.locator("#out")).toContainText("Cleaned for clarity:");
+    await expect(page.locator("#out")).toContainText("Hello from the stub.");
+
+    // save twice → one course group, one subject-fallback group
     await page.click("#dlOrg");
     await expect(page.locator("#dlOrg")).toHaveText("Save organized");
     await page.click("#dlOrg");
     await expect(page.locator("#library")).toBeVisible();
-    await expect(page.locator(".libGroup")).toHaveText(["History", "Theology"]); // sorted
+    await expect(page.locator(".libGroup")).toHaveText(
+      ["History", "TH 3301 — Systematic Theology"]); // sorted
     await expect(page.locator(".libItem")).toHaveCount(2);
 
     // archive survives a reload (IndexedDB)
@@ -210,7 +233,7 @@ test.describe("organized save + library + zip export", () => {
     await page.locator(".libItem .name", { hasText: "Grace and Free Will" }).click();
     await expect(page.locator("#out")).toContainText("Hello from the stub.");
 
-    // per-item pretty-printed HTML download
+    // per-item pretty-printed HTML download: heading + key points rendered
     const [itemDl] = await Promise.all([
       page.waitForEvent("download"),
       page.locator(".libItem", { hasText: "The Fall of Rome" }).locator("button", { hasText: "HTML" }).click(),
@@ -220,6 +243,8 @@ test.describe("organized save + library + zip export", () => {
     expect(html).toContain("The Fall of Rome");
     expect(html).toContain("History");
     expect(html).toContain("Hello from the stub.");
+    expect(html).toContain("<h2>Introduction</h2>");
+    expect(html).toContain("Key point one");
 
     // whole-archive zip export, validated with real unzip
     const [zipDl] = await Promise.all([
@@ -229,7 +254,7 @@ test.describe("organized save + library + zip export", () => {
     expect(zipDl.suggestedFilename()).toMatch(/^Transcriptions \d{4}-\d{2}-\d{2}\.zip$/);
     const zipPath = await zipDl.path();
     const listing = execSync(`unzip -l "${zipPath}"`, { encoding: "utf8" });
-    expect(listing).toContain("Transcriptions/Theology/2026-03-14 — Grace and Free Will.html");
+    expect(listing).toContain("Transcriptions/TH 3301 — Systematic Theology/2026-03-14 — Grace and Free Will.html");
     expect(listing).toContain("Transcriptions/History/2026-02-02 — The Fall of Rome.html");
     execSync(`unzip -t "${zipPath}"`); // CRC check — throws on a corrupt archive
 
