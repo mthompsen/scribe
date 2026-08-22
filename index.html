@@ -164,7 +164,7 @@
 /* ------------------------------------------------------------------ *
  * Config
  * ------------------------------------------------------------------ */
-const VERSION     = "1.11.1-models";   // bump on every change so builds are identifiable
+const VERSION     = "1.11.2-fenix";   // bump on every change so builds are identifiable
 const MODEL       = "whisper-large-v3";
 // Groq retires chat model IDs regularly (the llama-3.x ids 404 now), so each
 // role has a fallback chain tried in order; dead models are skipped per session.
@@ -290,6 +290,14 @@ function setProgress(p){ bar.classList.add("show"); bar.value = Math.round(p*100
 /* ------------------------------------------------------------------ *
  * File selection
  * ------------------------------------------------------------------ */
+// Firefox on Android (Fenix) has a history of native crashes when its file
+// picker returns from a mixed accept list (mime wildcard + extensions).
+// Narrow the accept attribute there; the audio/* wildcard still covers
+// every supported container.
+if(/Android/i.test(navigator.userAgent) && /Firefox/i.test(navigator.userAgent)){
+  fileEl.setAttribute("accept", "audio/*");
+}
+
 drop.onclick = ()=> fileEl.click();
 ["dragenter","dragover"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.add("over")}));
 ["dragleave","drop"].forEach(e=>drop.addEventListener(e,ev=>{ev.preventDefault();drop.classList.remove("over")}));
