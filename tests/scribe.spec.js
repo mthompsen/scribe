@@ -57,7 +57,7 @@ test.describe("page load", () => {
   });
 });
 
-test.describe("container detection (§1 regression)", () => {
+test.describe("container detection", () => {
   test("magic bytes win over extension", async ({ page }) => {
     await page.goto("/index.html");
     const r = await page.evaluate(async () => {
@@ -82,7 +82,7 @@ test.describe("container detection (§1 regression)", () => {
   });
 });
 
-test.describe("small file (§1 regression)", () => {
+test.describe("small file", () => {
   test("under the limit goes up as a single request", async ({ page }) => {
     const { errors, groqRequests } = await instrument(page);
     await start(page, "fixture-small.mp3");
@@ -94,7 +94,7 @@ test.describe("small file (§1 regression)", () => {
   });
 });
 
-test.describe("large MP3 (§1 regression)", () => {
+test.describe("large MP3", () => {
   test("streaming splitter chunks on frame boundaries, no conversion", async ({ page }) => {
     const { errors, groqRequests } = await instrument(page);
     await start(page, "fixture-large.mp3");
@@ -113,7 +113,7 @@ test.describe("large MP3 (§1 regression)", () => {
   });
 });
 
-test.describe("the bug: large non-MP3 file (§2)", () => {
+test.describe("large non-MP3 file", () => {
   test("MP4/AAC named .mp3 is detected, converted in-browser, transcribed", async ({ page }) => {
     test.setTimeout(600_000);
     // The exact motivating case: phone recorder writes AAC into a ".mp3" name.
@@ -145,7 +145,7 @@ test.describe("the bug: large non-MP3 file (§2)", () => {
   });
 });
 
-test.describe("definition of done: huge non-MP3 file (§7.1)", () => {
+test.describe("huge non-MP3 file", () => {
   test("130 MB MP4/AAC named .mp3 converts, splits the converted MP3, transcribes", async ({ page }) => {
     test.setTimeout(600_000);
     const inputSize = fs.statSync(FIX("fixture-xl.mp3")).size;
